@@ -1,11 +1,12 @@
 {
   "name": "pirates-alert",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && vite build --config vite.content.config.js"
+    "build": "vite build && vite build --config vite.content.config.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.0.0",
@@ -13,6 +14,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^6.2.0"
+    "jsdom": "^30.1.3",
+    "vite": "^6.2.0",
+    "vitest": "^5.0.5"
   }
 }
