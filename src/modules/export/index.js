@@ -1,5 +1,22 @@
-export function formatExtractionPayload(metadata = {}, items = []) {
-  return {
+export function formatExtractionPayload(metadata = {}, items = [], fieldPreferences = null) {
+  let exportItems = items;
+  if (fieldPreferences && typeof fieldPreferences === 'object') {
+    exportItems = items.map((item) => {
+      const filtered = {};
+      for (const [key, val] of Object.entries(item)) {
+        if (key in fieldPreferences) {
+          if (fieldPreferences[key] === true) {
+            filtered[key] = val;
+          }
+        } else {
+          filtered[key] = val;
+        }
+      }
+      return filtered;
+    });
+  }
+
+  const payload = {
     extractor: 'PIRATES ALERT',
     version: '1.0.0',
     extractedAt: new Date().toISOString(),
@@ -8,8 +25,14 @@ export function formatExtractionPayload(metadata = {}, items = []) {
       title: metadata.title || ''
     },
     totalItems: items.length,
-    items
+    items: exportItems
   };
+
+  if (fieldPreferences && typeof fieldPreferences === 'object') {
+    payload.appliedPreferences = fieldPreferences;
+  }
+
+  return payload;
 }
 
 export function serializeToJson(data, pretty = true) {

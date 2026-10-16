@@ -148,6 +148,10 @@ export function distinguishPrices(cardEl) {
       continue;
     }
 
+    if (el.children && el.children.length > 2) {
+      continue;
+    }
+
     const txt = normalizeText(el.textContent);
     if (!txt || txt.length > 50) {
       continue;
@@ -282,7 +286,13 @@ export function extractImageUrl(cardEl, baseUrl) {
     return null;
   }
 
-  const images = cardEl.querySelectorAll('img, source');
+  const images = [];
+  if (cardEl.matches && cardEl.matches('img, source')) {
+    images.push(cardEl);
+  }
+  if (cardEl.querySelectorAll) {
+    images.push(...Array.from(cardEl.querySelectorAll('img, source')));
+  }
   for (const img of images) {
     const candidates = [
       img.getAttribute('data-src'),

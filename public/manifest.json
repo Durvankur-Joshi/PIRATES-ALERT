@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "PIRATES ALERT",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "AI-assisted product search results extractor.",
   "permissions": [
-    "activeTab"
+    "activeTab",
+    "storage"
   ],
   "action": {
     "default_popup": "popup.html",

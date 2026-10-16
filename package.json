@@ -1,12 +1,13 @@
 {
   "name": "pirates-alert",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build && vite build --config vite.content.config.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "server": "node server/proxy.js"
   },
   "dependencies": {
     "react": "^19.0.0",

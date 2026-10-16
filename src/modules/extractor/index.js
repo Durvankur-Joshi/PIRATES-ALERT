@@ -2,6 +2,7 @@ import {
   normalizeText,
   resolveAbsoluteUrl,
   distinguishPrices,
+  parseCurrencyAndPrice,
   parseRating,
   parseCounts,
   extractImageUrl,
@@ -15,10 +16,12 @@ import { findProductCards } from './cardDetector.js';
 function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   let title = null;
   if (rule.titleSelector) {
-    const el = cardEl.querySelector(rule.titleSelector);
-    if (el) {
-      title = normalizeText(el.textContent);
-    }
+    try {
+      const el = cardEl.querySelector(rule.titleSelector);
+      if (el) {
+        title = normalizeText(el.textContent);
+      }
+    } catch {}
   }
   if (!title) {
     title = extractTitle(cardEl);
@@ -26,10 +29,12 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
 
   let product_url = null;
   if (rule.urlSelector) {
-    const el = cardEl.querySelector(rule.urlSelector);
-    if (el && el.getAttribute('href')) {
-      product_url = resolveAbsoluteUrl(el.getAttribute('href'), baseUrl);
-    }
+    try {
+      const el = cardEl.querySelector(rule.urlSelector);
+      if (el && el.getAttribute('href')) {
+        product_url = resolveAbsoluteUrl(el.getAttribute('href'), baseUrl);
+      }
+    } catch {}
   }
   if (!product_url) {
     product_url = extractProductUrl(cardEl, baseUrl);
@@ -39,17 +44,60 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
 
   let image_url = null;
   if (rule.imageSelector) {
-    const el = cardEl.querySelector(rule.imageSelector);
-    if (el) {
-      image_url = extractImageUrl(el, baseUrl);
-    }
+    try {
+      const el = cardEl.querySelector(rule.imageSelector);
+      if (el) {
+        image_url = extractImageUrl(el, baseUrl);
+      }
+    } catch {}
   }
   if (!image_url) {
     image_url = extractImageUrl(cardEl, baseUrl);
   }
 
-  const priceData = distinguishPrices(cardEl);
-  const rating = parseRating(cardEl);
+  let priceData = null;
+  if (rule.priceSelector) {
+    try {
+      const el = cardEl.querySelector(rule.priceSelector);
+      if (el) {
+        const parsed = parseCurrencyAndPrice(el.textContent);
+        if (parsed.price !== null) {
+          priceData = {
+            selling_price: parsed.price,
+            mrp: null,
+            currency: parsed.currency
+          };
+          if (rule.mrpSelector) {
+            const mrpEl = cardEl.querySelector(rule.mrpSelector);
+            if (mrpEl) {
+              const mrpParsed = parseCurrencyAndPrice(mrpEl.textContent);
+              if (mrpParsed.price !== null) {
+                priceData.mrp = mrpParsed.price;
+                if (!priceData.currency) priceData.currency = mrpParsed.currency;
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  if (!priceData || priceData.selling_price === null) {
+    priceData = distinguishPrices(cardEl);
+  }
+
+  let rating = null;
+  if (rule.ratingSelector) {
+    try {
+      const el = cardEl.querySelector(rule.ratingSelector);
+      if (el) {
+        rating = parseRating(el);
+      }
+    } catch {}
+  }
+  if (rating === null) {
+    rating = parseRating(cardEl);
+  }
+
   const counts = parseCounts(cardEl);
   const extra = extractExtraAttributes(cardEl);
 
@@ -214,9 +262,9 @@ export function createExtractionEngine(config = {}) {
     },
     getCapabilities() {
       return {
-        engineVersion: '2.0.0',
-        supportedPipelines: ['heuristic', 'rules'],
-        activePipeline: 'generic_code_based'
+        engineVersion: '3.0.0',
+        supportedPipelines: ['saved_rules', 'ai_learning', 'heuristic'],
+        activePipeline: 'adaptive_multi_source'
       };
     }
   };
