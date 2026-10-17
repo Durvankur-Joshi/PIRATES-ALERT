@@ -3,6 +3,26 @@ import { MESSAGE_TYPES, EXTRACTION_STATUS, EXTRACTION_SOURCE } from '../modules/
 import { getActiveTab, sendMessageToTab, isExtensionEnvironment } from '../modules/messaging/index.js';
 import { formatExtractionPayload, triggerJsonDownload } from '../modules/export/index.js';
 import { ALL_CANONICAL_FIELDS, getDefaultFieldPreferences } from '../modules/preferences/index.js';
+import { normalizeHostname } from '../modules/rules/index.js';
+
+function getHostnameFromUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return normalizeHostname(parsed.hostname);
+    }
+    if (
+      parsed.protocol === 'chrome:' ||
+      parsed.protocol === 'edge:' ||
+      parsed.protocol === 'about:' ||
+      parsed.protocol === 'chrome-extension:'
+    ) {
+      return 'internal';
+    }
+  } catch {}
+  return '';
+}
 
 export default function App() {
   const [pageInfo, setPageInfo] = useState({
@@ -12,7 +32,8 @@ export default function App() {
     layoutFingerprint: '',
     hasSavedRule: false,
     savedRuleId: null,
-    activeVersionId: null
+    activeVersionId: null,
+    hasListingEvidence: false
   });
   const [connectionStatus, setConnectionStatus] = useState(EXTRACTION_STATUS.CONNECTING);
   const [statusMessage, setStatusMessage] = useState('Querying active tab and content script...');
@@ -47,11 +68,12 @@ export default function App() {
         setPageInfo({
           url: window.location.href,
           title: 'Development Preview',
-          hostname: window.location.hostname,
+          hostname: normalizeHostname(window.location.hostname),
           layoutFingerprint: 'layout_preview',
           hasSavedRule: false,
           savedRuleId: null,
-          activeVersionId: null
+          activeVersionId: null,
+          hasListingEvidence: true
         });
         setConnectionStatus(EXTRACTION_STATUS.READY);
         setStatusMessage('Running in browser preview mode');
@@ -68,7 +90,8 @@ export default function App() {
             layoutFingerprint: '',
             hasSavedRule: false,
             savedRuleId: null,
-            activeVersionId: null
+            activeVersionId: null,
+            hasListingEvidence: false
           });
           setConnectionStatus(EXTRACTION_STATUS.UNAVAILABLE);
           setStatusMessage('Could not detect an active browser tab.');
@@ -77,7 +100,15 @@ export default function App() {
 
         setActiveTabId(tab.id);
 
-        if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://') || tab.url?.startsWith('about:')) {
+        const tabHost = getHostnameFromUrl(tab.url);
+        const isSystemPage =
+          tabHost === 'internal' ||
+          tab.url?.startsWith('chrome://') ||
+          tab.url?.startsWith('edge://') ||
+          tab.url?.startsWith('about:') ||
+          tab.url?.startsWith('chrome-extension://');
+
+        if (isSystemPage) {
           setPageInfo({
             url: tab.url,
             title: tab.title || 'System Tab',
@@ -85,7 +116,8 @@ export default function App() {
             layoutFingerprint: '',
             hasSavedRule: false,
             savedRuleId: null,
-            activeVersionId: null
+            activeVersionId: null,
+            hasListingEvidence: false
           });
           setConnectionStatus(EXTRACTION_STATUS.UNAVAILABLE);
           setStatusMessage('Browser system pages cannot be extracted.');
@@ -97,14 +129,16 @@ export default function App() {
         });
 
         if (response.success && response.data) {
+          const normHost = response.data.hostname ? normalizeHostname(response.data.hostname) : tabHost;
           setPageInfo({
             url: response.data.url || tab.url || '',
             title: response.data.title || tab.title || '',
-            hostname: response.data.hostname || '',
+            hostname: normHost,
             layoutFingerprint: response.data.layoutFingerprint || '',
             hasSavedRule: Boolean(response.data.hasSavedRule),
             savedRuleId: response.data.savedRuleId || null,
-            activeVersionId: response.data.activeVersionId || null
+            activeVersionId: response.data.activeVersionId || null,
+            hasListingEvidence: Boolean(response.data.hasListingEvidence)
           });
           if (response.data.effectivePreferences) {
             setEffectivePreferences(response.data.effectivePreferences);
@@ -119,11 +153,12 @@ export default function App() {
           setPageInfo({
             url: tab.url || 'Restricted Page',
             title: tab.title || 'Tab Detected',
-            hostname: '',
+            hostname: tabHost,
             layoutFingerprint: '',
             hasSavedRule: false,
             savedRuleId: null,
-            activeVersionId: null
+            activeVersionId: null,
+            hasListingEvidence: false
           });
           setConnectionStatus(EXTRACTION_STATUS.READY);
           setStatusMessage('Active tab detected via activeTab permission.');
@@ -135,6 +170,52 @@ export default function App() {
     }
 
     initPageConnection();
+
+    let onActivated = null;
+    let onUpdated = null;
+    let onStorage = null;
+
+    if (typeof chrome !== 'undefined') {
+      if (chrome.tabs?.onActivated) {
+        onActivated = () => {
+          setExtractionResult(null);
+          setAiProposal(null);
+          setLearningError(null);
+          initPageConnection();
+        };
+        chrome.tabs.onActivated.addListener(onActivated);
+      }
+      if (chrome.tabs?.onUpdated) {
+        onUpdated = (tabId, changeInfo) => {
+          if (changeInfo.url || changeInfo.status === 'complete') {
+            initPageConnection();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+      }
+      if (chrome.storage?.onChanged) {
+        onStorage = (changes, areaName) => {
+          if (areaName === 'local') {
+            loadSavedRules();
+          }
+        };
+        chrome.storage.onChanged.addListener(onStorage);
+      }
+    }
+
+    return () => {
+      if (typeof chrome !== 'undefined') {
+        if (onActivated && chrome.tabs?.onActivated) {
+          chrome.tabs.onActivated.removeListener(onActivated);
+        }
+        if (onUpdated && chrome.tabs?.onUpdated) {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+        }
+        if (onStorage && chrome.storage?.onChanged) {
+          chrome.storage.onChanged.removeListener(onStorage);
+        }
+      }
+    };
   }, []);
 
   async function handleExtractClick() {
@@ -187,6 +268,19 @@ export default function App() {
       if (data.effectivePreferences) {
         setEffectivePreferences(data.effectivePreferences);
       }
+      if (data.layoutFingerprint || data.hasListingEvidence !== undefined) {
+        setPageInfo((prev) => ({
+          ...prev,
+          layoutFingerprint: data.layoutFingerprint || prev.layoutFingerprint,
+          hasSavedRule: data.source === EXTRACTION_SOURCE.SAVED_RULE ? true : prev.hasSavedRule,
+          savedRuleId: data.appliedRuleId || prev.savedRuleId,
+          hasListingEvidence: Boolean(
+            data.hasListingEvidence ||
+            (data.items && data.items.length > 0) ||
+            (data.diagnostics?.candidateCount > 0)
+          )
+        }));
+      }
       if (data.source === EXTRACTION_SOURCE.SAVED_RULE) {
         setStatusMessage(`Reused saved rule (0 AI calls): Extracted ${data.items?.length || 0} products.`);
       } else {
@@ -199,54 +293,129 @@ export default function App() {
   }
 
   async function handleStartAiLearning() {
-    if (isLearning || !activeTabId) return;
+    if (isLearning) return;
+
+    if (!isExtensionEnvironment()) {
+      setIsLearning(true);
+      setLearningError(null);
+      setAiProposal(null);
+      setStatusMessage('Sampling candidate DOM cards and requesting AI layout proposal...');
+      setTimeout(() => {
+        setIsLearning(false);
+        setAiProposal({
+          proposedRule: {
+            hostname: window.location.hostname || 'preview.local',
+            layoutFingerprint: 'layout_preview',
+            cardSelector: '.preview-product-card',
+            fieldSelectors: {
+              titleSelector: '.preview-title',
+              priceSelector: '.preview-price'
+            },
+            confidence: 0.95
+          },
+          validation: {
+            valid: true,
+            candidateCount: 4,
+            acceptedCount: 4,
+            matchRate: 100,
+            errors: [],
+            warnings: []
+          }
+        });
+        setStatusMessage('AI proposed layout rules. Review validation preview below.');
+      }, 500);
+      return;
+    }
+
+    if (!activeTabId) {
+      setLearningError('No active tab detected for layout learning.');
+      setStatusMessage('No active tab detected for layout learning.');
+      return;
+    }
+
     setIsLearning(true);
     setLearningError(null);
     setAiProposal(null);
     setStatusMessage('Sampling candidate DOM cards and requesting AI layout proposal...');
 
-    const response = await sendMessageToTab(activeTabId, {
-      type: MESSAGE_TYPES.AI_LEARN_LAYOUT,
-      diagnostics: extractionResult?.diagnostics || {}
-    });
+    try {
+      const response = await sendMessageToTab(activeTabId, {
+        type: MESSAGE_TYPES.AI_LEARN_LAYOUT,
+        diagnostics: extractionResult?.diagnostics || {},
+        callReason: extractionResult?.items?.length ? 'user_manual_learn' : 'heuristics_insufficient'
+      });
 
-    setIsLearning(false);
+      setIsLearning(false);
 
-    if (response.success && response.data?.success) {
-      setAiProposal(response.data);
-      setStatusMessage('AI proposed layout rules. Review validation preview below.');
-    } else {
-      const errMsg = response.data?.error || response.error || 'AI learning failed. Is the AI proxy server running?';
+      if (response && response.success && response.data?.success) {
+        setAiProposal(response.data);
+        setStatusMessage(
+          response.data.validation?.valid
+            ? 'AI proposed layout rules. Review validation preview below.'
+            : 'AI proposed layout rules, but live validation failed. Review errors below.'
+        );
+      } else {
+        const errMsg = response?.data?.error || response?.error || 'AI learning failed. Is the AI proxy server running?';
+        setLearningError(errMsg);
+        setStatusMessage(errMsg);
+      }
+    } catch (err) {
+      setIsLearning(false);
+      const errMsg = err?.message || 'Failed to communicate with active tab.';
       setLearningError(errMsg);
       setStatusMessage(errMsg);
     }
   }
 
   async function handleApplyAndSaveRule() {
-    if (!aiProposal || !aiProposal.proposedRule || !activeTabId) return;
-    setIsProcessing(true);
-    setStatusMessage('Saving validated rule and executing extraction...');
+    if (!aiProposal || !aiProposal.proposedRule || !aiProposal.validation?.valid) return;
 
-    const saveResponse = await sendMessageToTab(activeTabId, {
-      type: MESSAGE_TYPES.SAVE_RULE,
-      rule: {
-        ...aiProposal.proposedRule,
-        testResults: aiProposal.validation || {}
-      }
-    });
-
-    if (saveResponse.success && saveResponse.data?.success) {
+    if (!isExtensionEnvironment()) {
       setPageInfo((prev) => ({
         ...prev,
         hasSavedRule: true,
-        savedRuleId: saveResponse.data.rule?.id || null,
-        activeVersionId: saveResponse.data.rule?.activeVersionId || null
+        savedRuleId: 'rule_preview_layout',
+        activeVersionId: 'v1'
       }));
       setAiProposal(null);
-      await handleExtractClick();
-    } else {
       setIsProcessing(false);
-      setStatusMessage(saveResponse.data?.error || 'Failed to save rule.');
+      setStatusMessage('Preview mode: rule saved.');
+      return;
+    }
+
+    if (!activeTabId) return;
+    setIsProcessing(true);
+    setStatusMessage('Saving validated rule and executing extraction...');
+
+    try {
+      const saveResponse = await sendMessageToTab(activeTabId, {
+        type: MESSAGE_TYPES.SAVE_RULE,
+        rule: {
+          ...aiProposal.proposedRule,
+          testResults: aiProposal.validation || {}
+        }
+      });
+
+      if (saveResponse && saveResponse.success && saveResponse.data?.success) {
+        setPageInfo((prev) => ({
+          ...prev,
+          hasSavedRule: true,
+          savedRuleId: saveResponse.data.rule?.id || null,
+          activeVersionId: saveResponse.data.rule?.activeVersionId || null
+        }));
+        setAiProposal(null);
+        setIsProcessing(false);
+        await loadSavedRules();
+        await handleExtractClick();
+      } else {
+        setIsProcessing(false);
+        const errMsg = saveResponse?.data?.error || saveResponse?.error || 'Failed to save rule.';
+        setStatusMessage(errMsg);
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      const errMsg = err?.message || 'Save request failed.';
+      setStatusMessage(errMsg);
     }
   }
 
@@ -440,6 +609,33 @@ export default function App() {
   const diagnostics = extractionResult?.diagnostics;
   const fieldDiagnostics = diagnostics?.fieldDiagnostics || {};
 
+  const isSupportedPage =
+    connectionStatus === EXTRACTION_STATUS.READY &&
+    Boolean(pageInfo.hostname) &&
+    pageInfo.hostname !== 'internal' &&
+    !pageInfo.url?.startsWith('chrome://') &&
+    !pageInfo.url?.startsWith('edge://') &&
+    !pageInfo.url?.startsWith('about:') &&
+    !pageInfo.url?.startsWith('chrome-extension://');
+
+  const pageHasListingEvidence =
+    Boolean(
+      (extractionResult && (extractionResult.items?.length > 0 || (extractionResult.diagnostics?.candidateCount > 0) || extractionResult.hasListingEvidence)) ||
+      pageInfo.hasListingEvidence
+    );
+
+  const showLearnWithAi =
+    isSupportedPage &&
+    pageHasListingEvidence &&
+    !pageInfo.hasSavedRule &&
+    extractionResult?.source !== EXTRACTION_SOURCE.SAVED_RULE;
+
+  const isHeuristicUnambiguous =
+    !pageInfo.hasSavedRule &&
+    extractionResult?.source === EXTRACTION_SOURCE.HEURISTIC &&
+    items.length > 0 &&
+    (extractionResult?.isUnambiguous || (fieldDiagnostics?.title?.fillRate || 0) >= 80);
+
   return (
     <div className="popup-container">
       <header className="header">
@@ -515,6 +711,15 @@ export default function App() {
                 <span>
                   Saved Rule Active: <strong>{pageInfo.savedRuleId}</strong> ({pageInfo.activeVersionId || 'v1'}) (0 AI calls)
                 </span>
+                <button
+                  id="btn-relearn-rule"
+                  className="btn-relearn"
+                  onClick={handleStartAiLearning}
+                  disabled={isLearning || isProcessing}
+                  title="Explicitly re-learn and update the rule for this layout"
+                >
+                  {isLearning ? 'Learning...' : 'Re-learn with AI'}
+                </button>
               </div>
             )}
           </section>
@@ -533,7 +738,7 @@ export default function App() {
               <span>{isProcessing ? 'Extracting...' : items.length > 0 ? 'Re-extract' : 'Extract Products'}</span>
             </button>
 
-            {extractionResult?.canLearnWithAi && (
+            {showLearnWithAi && (
               <button
                 id="btn-ai-learn"
                 className="btn-ai-learn"
@@ -565,6 +770,17 @@ export default function App() {
             )}
           </div>
 
+          {isHeuristicUnambiguous && (
+            <div className="ai-hint-banner" id="heuristic-unambiguous-hint">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="16" x2="12" y2="12" />
+                <line x1="12" y1="8" x2="12.01" y2="8" />
+              </svg>
+              <span>Heuristics extracted products cleanly. AI learning is optional and creates a reusable rule for this layout.</span>
+            </div>
+          )}
+
           <section className="status-placeholder-card">
             <div className="status-header-row">
               <span className="status-header-title">Status & Engine</span>
@@ -595,7 +811,7 @@ export default function App() {
           </section>
 
           {aiProposal && (
-            <section className="proposal-card">
+            <section className="proposal-card" id="ai-proposal-section">
               <div className="proposal-header">
                 <span className="proposal-title">AI Layout Rule Proposal</span>
                 <span className={`validation-badge ${aiProposal.validation?.valid ? 'valid' : 'invalid'}`}>
@@ -615,32 +831,107 @@ export default function App() {
                   <span className="field-lbl">Price:</span>
                   <code>{aiProposal.proposedRule?.fieldSelectors?.priceSelector || 'auto'}</code>
                 </div>
+                {aiProposal.proposedRule?.fieldSelectors?.mrpSelector && (
+                  <div className="proposal-field">
+                    <span className="field-lbl">MRP:</span>
+                    <code>{aiProposal.proposedRule.fieldSelectors.mrpSelector}</code>
+                  </div>
+                )}
+                {aiProposal.proposedRule?.fieldSelectors?.urlSelector && (
+                  <div className="proposal-field">
+                    <span className="field-lbl">URL:</span>
+                    <code>{aiProposal.proposedRule.fieldSelectors.urlSelector}</code>
+                  </div>
+                )}
+                {aiProposal.proposedRule?.fieldSelectors?.imageSelector && (
+                  <div className="proposal-field">
+                    <span className="field-lbl">Image:</span>
+                    <code>{aiProposal.proposedRule.fieldSelectors.imageSelector}</code>
+                  </div>
+                )}
+                {aiProposal.proposedRule?.fieldSelectors?.ratingSelector && (
+                  <div className="proposal-field">
+                    <span className="field-lbl">Rating:</span>
+                    <code>{aiProposal.proposedRule.fieldSelectors.ratingSelector}</code>
+                  </div>
+                )}
                 <div className="proposal-stats">
                   <span>Matched: <strong>{aiProposal.validation?.candidateCount || 0}</strong> cards</span>
-                  <span>Match Rate: <strong>{aiProposal.validation?.matchRate || 0}%</strong></span>
+                  <span>Match Rate: <strong>{aiProposal.validation?.matchRate ?? 0}%</strong></span>
                 </div>
               </div>
+
+              {!aiProposal.validation?.valid && aiProposal.validation?.errors?.length > 0 && (
+                <div className="proposal-errors-banner" id="proposal-validation-errors">
+                  <span className="proposal-errors-title">Saving is blocked because candidate failed validation:</span>
+                  <ul className="proposal-errors-list">
+                    {aiProposal.validation.errors.map((err, idx) => (
+                      <li key={idx}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <div className="proposal-actions">
+                {aiProposal.validation?.valid ? (
+                  <button
+                    id="btn-save-apply-rule"
+                    className="btn-apply-rule"
+                    onClick={handleApplyAndSaveRule}
+                    disabled={isProcessing}
+                  >
+                    {isProcessing ? 'Saving...' : 'Save & Apply Rule'}
+                  </button>
+                ) : (
+                  <button
+                    id="btn-retry-ai-learn"
+                    className="btn-retry-rule"
+                    onClick={handleStartAiLearning}
+                    disabled={isLearning || isProcessing}
+                  >
+                    {isLearning ? 'Retrying...' : 'Retry Learning'}
+                  </button>
+                )}
                 <button
-                  className="btn-apply-rule"
-                  onClick={handleApplyAndSaveRule}
-                  disabled={!aiProposal.validation?.valid}
-                >
-                  Save & Apply Rule
-                </button>
-                <button
+                  id="btn-dismiss-proposal"
                   className="btn-cancel-rule"
-                  onClick={() => setAiProposal(null)}
+                  onClick={() => {
+                    setAiProposal(null);
+                    setLearningError(null);
+                  }}
+                  disabled={isProcessing}
                 >
-                  Dismiss
+                  {aiProposal.validation?.valid ? 'Dismiss' : 'Cancel'}
                 </button>
               </div>
             </section>
           )}
 
           {learningError && (
-            <div className="error-banner">
-              <span>{learningError}</span>
+            <div className="error-banner" id="ai-learning-error">
+              <div className="error-banner-content">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <span>{learningError}</span>
+              </div>
+              <div className="error-banner-actions">
+                <button
+                  className="btn-banner-retry"
+                  onClick={handleStartAiLearning}
+                  disabled={isLearning || isProcessing}
+                >
+                  Retry
+                </button>
+                <button
+                  className="btn-banner-dismiss"
+                  onClick={() => setLearningError(null)}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
           )}
 
@@ -745,10 +1036,18 @@ export default function App() {
                 </svg>
               </div>
               <h2 className="empty-state-title">
-                {extractionResult ? 'No Products Identified' : 'No Extraction Initiated'}
+                {!pageHasListingEvidence && (extractionResult || !isSupportedPage)
+                  ? 'No Product Listing Detected'
+                  : extractionResult
+                  ? 'No Products Identified'
+                  : 'No Extraction Initiated'}
               </h2>
               <p className="empty-state-description">
-                {extractionResult
+                {!isSupportedPage
+                  ? 'Browser internal and system pages cannot be extracted.'
+                  : !pageHasListingEvidence && (extractionResult || !pageInfo.hasListingEvidence)
+                  ? 'This page does not appear to contain a product listing or search results. AI layout learning is unavailable because no product cards, pricing, or product elements were detected.'
+                  : extractionResult
                   ? 'DOM heuristics could not confidently isolate product cards on this page. Click "Learn with AI" above to deduce extraction rules.'
                   : 'Open any product search results or category listing page and click "Extract Products" to capture structured data.'}
               </p>
@@ -761,11 +1060,44 @@ export default function App() {
         <section className="tab-view-container">
           <div className="tab-view-header">
             <span className="tab-view-title">Saved Layout Rules ({savedRules.length})</span>
-            <span className="tab-view-hint">Persisted with immutable version history</span>
+            <button
+              id="btn-rules-learn-ai"
+              className="btn-rules-learn"
+              onClick={() => {
+                setActiveView('main');
+                if (!isSupportedPage) {
+                  setStatusMessage('AI learning requires an active HTTP/HTTPS product listing page.');
+                } else if (!pageHasListingEvidence) {
+                  setStatusMessage('This page does not contain product listing evidence. AI learning requires product cards or pricing.');
+                } else {
+                  handleStartAiLearning();
+                }
+              }}
+              title="Learn layout for current page"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+              </svg>
+              <span>Learn with AI</span>
+            </button>
           </div>
           {savedRules.length === 0 ? (
             <div className="tab-empty-state">
-              <span>No saved rules yet. Rules are saved when you validate an AI layout proposal.</span>
+              <div className="tab-empty-content">
+                <span>No saved rules yet. Rules are created and saved when you validate an AI layout proposal.</span>
+                {isSupportedPage && pageHasListingEvidence && !pageInfo.hasSavedRule && (
+                  <button
+                    id="btn-empty-rules-learn"
+                    className="btn-rules-learn-empty"
+                    onClick={() => {
+                      setActiveView('main');
+                      handleStartAiLearning();
+                    }}
+                  >
+                    Learn Current Page Layout
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="rules-list">
@@ -956,11 +1288,22 @@ export default function App() {
       )}
 
       {editingCard && (
-        <div className="modal-backdrop">
-          <div className="correction-dialog">
+        <div
+          className="modal-backdrop"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setEditingCard(null);
+          }}
+        >
+          <div className="correction-dialog" role="dialog" aria-modal="true">
             <div className="dialog-header">
               <span className="dialog-title">Correct Product #{editingCard.cardIndex + 1}</span>
-              <button className="btn-dialog-close" onClick={() => setEditingCard(null)}>✕</button>
+              <button
+                className="btn-dialog-close"
+                onClick={() => setEditingCard(null)}
+                aria-label="Close dialog"
+              >
+                ✕
+              </button>
             </div>
             <div className="dialog-body">
               {correctionError && (
@@ -1001,9 +1344,9 @@ export default function App() {
           <span className="footer-pill active">Rules</span>
           <span className="footer-pill active">AI</span>
           <span className="footer-pill active">Export</span>
-          <span className="footer-pill active">P4</span>
+          <span className="footer-pill active">P5</span>
         </div>
-        <span className="footer-meta">v0.4.0 • Phase 4</span>
+        <span className="footer-meta">v0.5.0 • Phase 5</span>
       </footer>
     </div>
   );

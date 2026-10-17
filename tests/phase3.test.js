@@ -39,6 +39,7 @@ describe('Phase 3: Stabilization & Strict Workflow Enforcement', () => {
         fieldSelectors: {
           titleSelector: '.item-heading',
           priceSelector: '.amount-tag',
+          urlSelector: '.item-heading a',
           imageSelector: '.lazy-prod'
         },
         confidence: 0.95

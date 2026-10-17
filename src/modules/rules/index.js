@@ -42,6 +42,18 @@ async function writeStorage(data) {
   return true;
 }
 
+export function normalizeHostname(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let host = raw.trim().toLowerCase();
+  if (host.endsWith('.')) {
+    host = host.slice(0, -1);
+  }
+  if (host.startsWith('www.')) {
+    host = host.slice(4);
+  }
+  return host;
+}
+
 export function computeLayoutFingerprint(doc, hostname = '') {
   if (!doc) {
     return 'default_layout';
@@ -152,11 +164,12 @@ export function createRulesRepository() {
       try {
         const store = await readStorage();
         const rules = Object.values(store);
+        const targetHost = normalizeHostname(hostname);
 
         const exactMatch = rules.find(
           (r) =>
             r &&
-            r.hostname === hostname &&
+            normalizeHostname(r.hostname) === targetHost &&
             r.layoutFingerprint === layoutFingerprint &&
             r.validationStatus === 'VALIDATED' &&
             r.schemaVersion === '1.0' &&
@@ -182,7 +195,8 @@ export function createRulesRepository() {
 
       try {
         const store = await readStorage();
-        const id = ruleDefinition.id || `rule_${ruleDefinition.hostname}_${ruleDefinition.layoutFingerprint}`;
+        const normalizedHost = normalizeHostname(ruleDefinition.hostname);
+        const id = ruleDefinition.id || `rule_${normalizedHost}_${ruleDefinition.layoutFingerprint}`;
         const now = new Date().toISOString();
 
         const rawExisting = store[id];
@@ -199,6 +213,14 @@ export function createRulesRepository() {
           return {
             success: false,
             error: 'Cannot overwrite an existing validated rule with an unvalidated proposal',
+            preservedRule: existing
+          };
+        }
+
+        if (ruleDefinition.testResults && ruleDefinition.testResults.valid === false) {
+          return {
+            success: false,
+            error: `Rule failed validation: ${(ruleDefinition.testResults.errors || []).join('; ')}`,
             preservedRule: existing
           };
         }
@@ -247,7 +269,8 @@ export function createRulesRepository() {
 
         const ruleRecord = {
           id,
-          hostname: ruleDefinition.hostname,
+          hostname: normalizedHost,
+          rawHostname: ruleDefinition.hostname,
           layoutFingerprint: ruleDefinition.layoutFingerprint,
           cardSelector: ruleDefinition.cardSelector.trim(),
           fieldSelectors: ruleDefinition.fieldSelectors || {},

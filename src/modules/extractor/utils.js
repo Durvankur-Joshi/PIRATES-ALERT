@@ -11,12 +11,15 @@ export function resolveAbsoluteUrl(href, baseUrl) {
     return null;
   }
   const cleanHref = href.trim();
-  if (cleanHref.startsWith('javascript:') || cleanHref.startsWith('#') || cleanHref.startsWith('data:')) {
+  if (cleanHref.match(/^(javascript|vbscript|data|file):/i) || cleanHref.startsWith('#')) {
     return null;
   }
   try {
     const base = baseUrl || (typeof document !== 'undefined' ? document.baseURI || window.location.href : 'http://localhost');
     const resolved = new URL(cleanHref, base);
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
+      return null;
+    }
     return resolved.href;
   } catch {
     return null;
@@ -24,15 +27,19 @@ export function resolveAbsoluteUrl(href, baseUrl) {
 }
 
 const CURRENCY_SYMBOLS = {
+  '₹': '₹',
+  'Rs.': '₹',
+  'Rs': '₹',
+  'rs.': '₹',
+  'rs': '₹',
   '$': '$',
   '€': '€',
   '£': '£',
-  '₹': '₹',
   '¥': '¥',
   '₩': '₩',
   '₽': '₽',
   '₪': '₪',
-  '₨': '₨',
+  '₨': '₹',
   '₱': '₱',
   '₫': '₫',
   '฿': '฿'
@@ -51,14 +58,14 @@ export function parseCurrencyAndPrice(text) {
     return { currency: null, price: null };
   }
 
-  if (normalized.match(/(?:\/5|\/ 5|out of 5|stars?|★)/i) && !normalized.match(/[$€£₹¥]/)) {
+  if (normalized.match(/(?:\/5|\/ 5|out of 5|stars?|★)/i) && !normalized.match(/[$€£₹¥]|(?:Rs\.?|INR)/i)) {
     return { currency: null, price: null };
   }
 
   let foundCurrency = null;
-  for (const symbol of Object.keys(CURRENCY_SYMBOLS)) {
+  for (const [symbol, canonical] of Object.entries(CURRENCY_SYMBOLS)) {
     if (normalized.includes(symbol)) {
-      foundCurrency = symbol;
+      foundCurrency = canonical;
       break;
     }
   }
@@ -73,13 +80,32 @@ export function parseCurrencyAndPrice(text) {
     }
   }
 
-  const pricePattern = /(?:[0-9]{1,3}(?:[.,][0-9]{3})+[.,][0-9]{1,2}(?![0-9])|[0-9]+[.,][0-9]{1,2}(?![0-9])|[0-9]{1,3}(?:[.,][0-9]{3})+(?![0-9])|[0-9]+)/g;
-  const matches = normalized.match(pricePattern);
+  const sanitized = normalized.replace(/(\d)\s+(\d{3})/g, '$1$2');
+
+  const pricePattern = /(?:[0-9]{1,2}(?:,[0-9]{2})+,[0-9]{3}(?:\.[0-9]{1,2})?|[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?|[0-9]{1,3}(?:\.[0-9]{3})+,[0-9]{1,2}|[0-9]{1,3}(?:\.[0-9]{3})+(?![0-9])|[0-9]+[.,][0-9]{1,2}(?![0-9])|[0-9]+)/g;
+  const matches = sanitized.match(pricePattern);
   if (!matches || matches.length === 0) {
     return { currency: foundCurrency, price: null };
   }
 
-  const rawNum = matches[0];
+  let rawNum = matches[0];
+  if (matches.length > 1) {
+    for (const m of matches) {
+      const idx = sanitized.indexOf(m);
+      if (idx !== -1) {
+        const after = sanitized.slice(idx + m.length, idx + m.length + 3);
+        if (after.includes('%')) {
+          continue;
+        }
+        const before = sanitized.slice(Math.max(0, idx - 6), idx);
+        if (/[$€£₹¥]|(?:Rs\.?|INR|USD|EUR|GBP)/i.test(before) || /[$€£₹¥]|(?:Rs\.?|INR|USD|EUR|GBP)/i.test(after)) {
+          rawNum = m;
+          break;
+        }
+      }
+    }
+  }
+
   let parsedNumber = null;
 
   if (rawNum.includes(',') && rawNum.includes('.')) {
@@ -110,6 +136,143 @@ export function parseCurrencyAndPrice(text) {
     currency: foundCurrency,
     price: Number.isFinite(parsedNumber) ? parsedNumber : null
   };
+}
+
+export function extractPriceFromElement(el, isSellingPrice = true) {
+  if (!el) {
+    return { currency: null, price: null };
+  }
+
+  const directAttr =
+    el.getAttribute('data-price') ||
+    el.getAttribute('data-product-price') ||
+    (el.tagName === 'META' || el.hasAttribute('itemprop') ? el.getAttribute('content') : null) ||
+    el.getAttribute('value');
+
+  if (directAttr) {
+    const parsedAttr = parseCurrencyAndPrice(directAttr);
+    if (parsedAttr.price !== null) {
+      return parsedAttr;
+    }
+  }
+
+  let text = el.textContent || '';
+  if (isSellingPrice) {
+    const hasStrike = Boolean(
+      el.querySelector &&
+      el.querySelector('del, s, strike, [class*="strike"], [class*="original"], [class*="mrp"], [class*="list-price"], [class*="old-price"], [class*="was-price"]')
+    );
+    if (hasStrike) {
+      try {
+        const clone = el.cloneNode(true);
+        const strikes = clone.querySelectorAll('del, s, strike, [class*="strike"], [class*="original"], [class*="mrp"], [class*="list-price"], [class*="old-price"], [class*="was-price"]');
+        for (const s of strikes) {
+          s.remove();
+        }
+        text = clone.textContent || '';
+      } catch {}
+    }
+  } else {
+    if (el.querySelector) {
+      const strikeChild = el.querySelector('del, s, strike, [class*="strike"], [class*="original"], [class*="mrp"], [class*="list-price"], [class*="old-price"], [class*="was-price"]');
+      if (strikeChild) {
+        const parsedStrike = parseCurrencyAndPrice(strikeChild.textContent);
+        if (parsedStrike.price !== null) {
+          return parsedStrike;
+        }
+      }
+    }
+  }
+
+  const parsed = parseCurrencyAndPrice(text);
+  if (parsed.price !== null) {
+    return parsed;
+  }
+
+  if (el.innerText && el.innerText !== text) {
+    const parsedInner = parseCurrencyAndPrice(el.innerText);
+    if (parsedInner.price !== null) {
+      return parsedInner;
+    }
+  }
+
+  if (el.querySelector) {
+    const meta = el.querySelector('meta[itemprop="price"], [itemprop="price"][content], [data-price]');
+    if (meta) {
+      const val = meta.getAttribute('content') || meta.getAttribute('data-price');
+      if (val) {
+        const parsedMeta = parseCurrencyAndPrice(val);
+        if (parsedMeta.price !== null) {
+          return parsedMeta;
+        }
+      }
+    }
+  }
+
+  return { currency: null, price: null };
+}
+
+export function queryCardElement(cardEl, selector, cardSelector = '') {
+  if (!cardEl || !selector || typeof selector !== 'string') return null;
+  const trimmed = selector.trim();
+  if (!trimmed) return null;
+
+  let cleanSelector = trimmed;
+  if (cardSelector && cleanSelector.startsWith(cardSelector)) {
+    cleanSelector = cleanSelector.slice(cardSelector.length).trim();
+  }
+  if (!cleanSelector) {
+    return cardEl;
+  }
+
+  try {
+    if (cardEl.matches && cardEl.matches(cleanSelector)) {
+      return cardEl;
+    }
+  } catch {}
+
+  try {
+    const el = cardEl.querySelector(cleanSelector);
+    if (el) return el;
+  } catch {}
+
+  if (/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/.test(cleanSelector)) {
+    const classOnly = cleanSelector.replace(/^[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+.*)/, '$1');
+    try {
+      if (cardEl.matches && cardEl.matches(classOnly)) {
+        return cardEl;
+      }
+      const el = cardEl.querySelector(classOnly);
+      if (el) return el;
+    } catch {}
+  }
+
+  // Handle compound/descendant selectors (e.g., "div.hl05eU > div.Nx9bqj" or ".price-box .sale-price")
+  if (cleanSelector.includes(' ') || cleanSelector.includes('>')) {
+    const parts = cleanSelector.split(/[\s>+~]+/).filter(Boolean);
+    if (parts.length > 1) {
+      const leaf = parts[parts.length - 1];
+      try {
+        if (cardEl.matches && cardEl.matches(leaf)) {
+          return cardEl;
+        }
+        const el = cardEl.querySelector(leaf);
+        if (el) return el;
+      } catch {}
+      if (/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/.test(leaf)) {
+        const leafClassOnly = leaf.replace(/^[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+.*)/, '$1');
+        try {
+          if (cardEl.matches && cardEl.matches(leafClassOnly)) {
+            return cardEl;
+          }
+          const el = cardEl.querySelector(leafClassOnly);
+          if (el) return el;
+        } catch {}
+      }
+    }
+  }
+
+  return null;
 }
 
 export function distinguishPrices(cardEl) {
@@ -202,9 +365,24 @@ export function parseRating(cardEl) {
     return null;
   }
 
-  const ratingElements = cardEl.querySelectorAll(
-    '[class*="rating"], [class*="star"], [aria-label*="star"], [aria-label*="rating"], [data-rating], [itemprop="ratingValue"]'
-  );
+  const ratingElements = [];
+  if (cardEl.matches && cardEl.matches('[class*="rating"], [class*="star"], [aria-label*="star"], [aria-label*="rating"], [data-rating], [itemprop="ratingValue"]')) {
+    ratingElements.push(cardEl);
+  }
+  if (cardEl.getAttribute && (cardEl.getAttribute('aria-label') || cardEl.getAttribute('data-rating') || cardEl.getAttribute('data-score') || cardEl.getAttribute('content'))) {
+    if (!ratingElements.includes(cardEl)) {
+      ratingElements.push(cardEl);
+    }
+  }
+  if (cardEl.querySelectorAll) {
+    ratingElements.push(
+      ...Array.from(
+        cardEl.querySelectorAll(
+          '[class*="rating"], [class*="star"], [aria-label*="star"], [aria-label*="rating"], [data-rating], [itemprop="ratingValue"]'
+        )
+      )
+    );
+  }
 
   for (const el of ratingElements) {
     const ariaLabel = el.getAttribute('aria-label');
@@ -233,9 +411,19 @@ export function parseCounts(cardEl) {
     return { rating_count: null, review_count: null };
   }
 
-  const countElements = cardEl.querySelectorAll(
-    '[class*="review"], [class*="rating"], [class*="count"], a, span'
-  );
+  const countElements = [];
+  if (cardEl.textContent) {
+    countElements.push(cardEl);
+  }
+  if (cardEl.querySelectorAll) {
+    countElements.push(
+      ...Array.from(
+        cardEl.querySelectorAll(
+          '[class*="review"], [class*="rating"], [class*="count"], a, span'
+        )
+      )
+    );
+  }
 
   let foundRatingCount = null;
   let foundReviewCount = null;

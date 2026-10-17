@@ -53,7 +53,7 @@ export async function recordAiLog(entry = {}) {
     hostname: entry.hostname || 'unknown',
     callReason: entry.callReason || 'layout_learning',
     status: entry.status || 'SUCCESS',
-    model: entry.model || 'gemini-1.5-flash',
+    model: entry.model || 'gemini-2.5-flash',
     inputTokens: finalInputTokens,
     outputTokens: finalOutputTokens,
     inputEstimated,
@@ -108,8 +108,55 @@ export function sanitizeDomSnippet(rawHtml, maxLength = 2500) {
   return cleaned;
 }
 
+function testSelectorSyntax(selector) {
+  if (!selector || typeof selector !== 'string') return false;
+  const trimmed = selector.trim();
+  if (trimmed.length < 1 || trimmed.length > 250) return false;
+  if (trimmed.match(/<script|javascript:|on\w+=|eval\(|expression\(/i)) return false;
+
+  const openBrackets = (trimmed.match(/\[/g) || []).length;
+  const closeBrackets = (trimmed.match(/\]/g) || []).length;
+  if (openBrackets !== closeBrackets) return false;
+
+  const openParens = (trimmed.match(/\(/g) || []).length;
+  const closeParens = (trimmed.match(/\)/g) || []).length;
+  if (openParens !== closeParens) return false;
+
+  if (trimmed.startsWith(',') || trimmed.endsWith(',') || trimmed.endsWith('>') || trimmed.endsWith('+') || trimmed.endsWith('~')) {
+    return false;
+  }
+
+  if (trimmed.match(/:::[a-z]|^\.{3,}|^#{2,}/i)) {
+    return false;
+  }
+
+  if (typeof document !== 'undefined') {
+    try {
+      if (typeof document.createDocumentFragment === 'function') {
+        const frag = document.createDocumentFragment();
+        frag.querySelector(trimmed);
+        return true;
+      }
+      if (typeof document.querySelector === 'function') {
+        document.querySelector(trimmed);
+        return true;
+      }
+    } catch {
+      return false;
+    }
+  } else if (typeof globalThis !== 'undefined' && globalThis.document) {
+    try {
+      globalThis.document.querySelector(trimmed);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function validateAiRuleResponse(parsedJson) {
-  if (!parsedJson || typeof parsedJson !== 'object') {
+  if (!parsedJson || typeof parsedJson !== 'object' || Array.isArray(parsedJson)) {
     return { valid: false, error: 'AI response is not a valid JSON object' };
   }
 
@@ -122,13 +169,61 @@ export function validateAiRuleResponse(parsedJson) {
     return { valid: false, error: 'Unsafe code detected in cardSelector' };
   }
 
-  const fieldSelectors = parsedJson.fieldSelectors || {};
-  for (const [key, sel] of Object.entries(fieldSelectors)) {
-    if (typeof sel !== 'string') {
+  if (!testSelectorSyntax(cardSelector)) {
+    return { valid: false, error: `Card selector has invalid CSS syntax: "${cardSelector}"` };
+  }
+
+  if (!parsedJson.fieldSelectors || typeof parsedJson.fieldSelectors !== 'object' || Array.isArray(parsedJson.fieldSelectors)) {
+    return { valid: false, error: 'AI response missing valid fieldSelectors' };
+  }
+
+  const rawFieldSelectors = parsedJson.fieldSelectors;
+  const normalizedFieldSelectors = {};
+
+  const requiredFields = ['titleSelector', 'priceSelector', 'urlSelector'];
+  const knownOptionalFields = [
+    'mrpSelector',
+    'imageSelector',
+    'ratingSelector',
+    'ratingCountSelector',
+    'reviewCountSelector'
+  ];
+
+  for (const reqKey of requiredFields) {
+    const val = rawFieldSelectors[reqKey];
+    if (typeof val !== 'string' || val.trim().length === 0) {
+      return { valid: false, error: `Missing or invalid required field selector: ${reqKey}` };
+    }
+    if (val.match(/<script|javascript:|on\w+=|eval\(|expression\(/i)) {
+      return { valid: false, error: `Unsafe code detected in field selector ${reqKey}` };
+    }
+    if (!testSelectorSyntax(val)) {
+      return { valid: false, error: `Field selector "${reqKey}" has invalid CSS syntax: "${val}"` };
+    }
+    normalizedFieldSelectors[reqKey] = val.trim();
+  }
+
+  for (const [key, val] of Object.entries(rawFieldSelectors)) {
+    if (requiredFields.includes(key)) continue;
+
+    if (val === null || val === undefined || (typeof val === 'string' && val.trim().length === 0)) {
+      normalizedFieldSelectors[key] = null;
+    } else if (typeof val === 'string') {
+      if (val.match(/<script|javascript:|on\w+=|eval\(|expression\(/i)) {
+        return { valid: false, error: `Unsafe code detected in field selector ${key}` };
+      }
+      if (!testSelectorSyntax(val)) {
+        return { valid: false, error: `Field selector "${key}" has invalid CSS syntax: "${val}"` };
+      }
+      normalizedFieldSelectors[key] = val.trim();
+    } else {
       return { valid: false, error: `Invalid selector type for field ${key}` };
     }
-    if (sel.match(/<script|javascript:|on\w+=|eval\(|expression\(/i)) {
-      return { valid: false, error: `Unsafe code detected in field selector ${key}` };
+  }
+
+  for (const optKey of knownOptionalFields) {
+    if (!(optKey in normalizedFieldSelectors)) {
+      normalizedFieldSelectors[optKey] = null;
     }
   }
 
@@ -136,7 +231,7 @@ export function validateAiRuleResponse(parsedJson) {
     valid: true,
     rule: {
       cardSelector: cardSelector.trim(),
-      fieldSelectors,
+      fieldSelectors: normalizedFieldSelectors,
       confidence: typeof parsedJson.confidence === 'number' ? parsedJson.confidence : 0.8
     }
   };
@@ -150,11 +245,14 @@ export function createAiLearningModule(configuration = {}) {
     setProxyUrl(url) {
       proxyUrl = url;
     },
+    getProxyUrl() {
+      return proxyUrl;
+    },
     setMockProvider(fn) {
       mockProvider = fn;
     },
     async learnLayout(context = {}) {
-      const { hostname, pageTitle, candidateSelectors, diagnostics, domSnippets, callReason } = context;
+      const { hostname, pageTitle, candidateSelectors, diagnostics, domSnippets, callReason, feedback } = context;
 
       const sanitizedSnippets = (domSnippets || []).slice(0, 2).map((s) => sanitizeDomSnippet(s));
       const payload = {
@@ -162,7 +260,8 @@ export function createAiLearningModule(configuration = {}) {
         pageTitle: pageTitle || '',
         candidateSelectors: candidateSelectors || [],
         diagnostics: diagnostics || {},
-        domSnippets: sanitizedSnippets
+        domSnippets: sanitizedSnippets,
+        feedback: feedback || null
       };
 
       const payloadString = JSON.stringify(payload);
@@ -213,78 +312,154 @@ export function createAiLearningModule(configuration = {}) {
         }
       }
 
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 12000);
+      let responseData = null;
+      let responseStatus = 200;
+      let responseOk = true;
+      let rawError = null;
 
-        const response = await fetch(proxyUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: payloadString,
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+      const PROXY_CLIENT_TIMEOUT_MS = 55000;
 
-        if (!response.ok) {
-          const errBody = await response.text();
+      if (typeof chrome !== 'undefined' && Boolean(chrome.runtime && chrome.runtime.sendMessage && !chrome.tabs)) {
+        try {
+          const bgResponse = await new Promise((resolve) => {
+            chrome.runtime.sendMessage(
+              {
+                type: 'PIRATES_ALERT_PROXY_FETCH',
+                url: proxyUrl,
+                payloadString,
+                timeoutMs: PROXY_CLIENT_TIMEOUT_MS
+              },
+              (res) => {
+                if (chrome.runtime?.lastError) {
+                  resolve(null);
+                } else {
+                  resolve(res);
+                }
+              }
+            );
+          });
+          if (bgResponse && bgResponse.handled) {
+            responseOk = bgResponse.ok;
+            responseStatus = bgResponse.status;
+            if (bgResponse.ok) {
+              try {
+                responseData = JSON.parse(bgResponse.text);
+              } catch (e) {
+                rawError = 'Failed to parse JSON response from proxy';
+                responseOk = false;
+              }
+            } else {
+              if (bgResponse.error === 'timeout') {
+                rawError = 'Request timed out after 55s. The proxy or upstream service took too long to respond.';
+              } else {
+                rawError = bgResponse.error || bgResponse.text;
+                try {
+                  const parsedErr = JSON.parse(bgResponse.text);
+                  if (parsedErr?.error) {
+                    rawError = parsedErr.error;
+                  }
+                } catch {}
+              }
+            }
+          }
+        } catch {}
+      }
+
+      if (responseData === null && rawError === null) {
+        let timeoutId;
+        try {
+          const controller = new AbortController();
+          timeoutId = setTimeout(() => controller.abort(), PROXY_CLIENT_TIMEOUT_MS);
+
+          const response = await fetch(proxyUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payloadString,
+            signal: controller.signal
+          });
+
+          responseOk = response.ok;
+          responseStatus = response.status;
+
+          if (!response.ok) {
+            const errText = await response.text().catch(() => '');
+            try {
+              const errJson = JSON.parse(errText);
+              rawError = errJson?.error || `Proxy error (HTTP ${response.status})`;
+            } catch {
+              rawError = errText.slice(0, 150) || `Proxy returned HTTP ${response.status}`;
+            }
+          } else {
+            responseData = await response.json();
+          }
+        } catch (err) {
+          responseOk = false;
+          let detail = err.message || '';
+          if (err.name === 'AbortError') {
+            detail = 'Request timed out after 55s. The proxy or upstream service took too long to respond.';
+          } else if (err.message?.includes('Failed to fetch') || err.message?.includes('ECONNREFUSED') || err.message?.includes('fetch failed') || err.cause?.code === 'ECONNREFUSED') {
+            detail = `Cannot connect to AI proxy server at ${proxyUrl}. Please ensure the local AI proxy server is running (npm run server).`;
+          }
+          rawError = `AI proxy connection failed: ${detail}`;
           await recordAiLog({
             hostname,
             callReason: callReason || 'layout_learning_proxy',
-            status: 'FAILED',
+            status: 'ERROR',
             payloadChars: payloadString.length,
-            responseChars: errBody.length,
+            responseChars: 0,
             inputEstimated: true,
             outputEstimated: true
           });
-          return { success: false, error: `Proxy returned status ${response.status}: ${errBody.slice(0, 100)}` };
+          return { success: false, error: rawError };
+        } finally {
+          if (timeoutId) clearTimeout(timeoutId);
         }
+      }
 
-        const data = await response.json();
-        const validation = validateAiRuleResponse(data);
-        if (!validation.valid) {
-          await recordAiLog({
-            hostname,
-            callReason: callReason || 'layout_learning_proxy',
-            status: 'FAILED',
-            payloadChars: payloadString.length,
-            responseChars: JSON.stringify(data).length,
-            inputEstimated: true,
-            outputEstimated: true
-          });
-          return { success: false, error: validation.error };
-        }
-
-        const promptTokens = data.usageMetadata?.promptTokenCount;
-        const candidateTokens = data.usageMetadata?.candidatesTokenCount;
-
+      if (!responseOk || !responseData) {
+        const finalError = rawError || `Proxy request failed with HTTP ${responseStatus}`;
         await recordAiLog({
           hostname,
           callReason: callReason || 'layout_learning_proxy',
-          status: 'SUCCESS',
+          status: 'FAILED',
           payloadChars: payloadString.length,
-          responseChars: JSON.stringify(data).length,
-          inputTokens: promptTokens,
-          outputTokens: candidateTokens,
-          inputEstimated: typeof promptTokens !== 'number',
-          outputEstimated: typeof candidateTokens !== 'number'
-        });
-
-        return { success: true, proposedRule: validation.rule };
-      } catch (err) {
-        await recordAiLog({
-          hostname,
-          callReason: callReason || 'layout_learning_proxy',
-          status: 'ERROR',
-          payloadChars: payloadString.length,
-          responseChars: 0,
+          responseChars: finalError.length,
           inputEstimated: true,
           outputEstimated: true
         });
-        return {
-          success: false,
-          error: `AI proxy connection failed (${err.name === 'AbortError' ? 'timeout' : err.message}). Please ensure the local AI proxy server is running.`
-        };
+        return { success: false, error: finalError };
       }
+
+      const validation = validateAiRuleResponse(responseData);
+      if (!validation.valid) {
+        await recordAiLog({
+          hostname,
+          callReason: callReason || 'layout_learning_proxy',
+          status: 'FAILED',
+          payloadChars: payloadString.length,
+          responseChars: JSON.stringify(responseData).length,
+          inputEstimated: true,
+          outputEstimated: true
+        });
+        return { success: false, error: validation.error };
+      }
+
+      const promptTokens = responseData.usageMetadata?.promptTokenCount;
+      const candidateTokens = responseData.usageMetadata?.candidatesTokenCount;
+
+      await recordAiLog({
+        hostname,
+        callReason: callReason || 'layout_learning_proxy',
+        status: 'SUCCESS',
+        payloadChars: payloadString.length,
+        responseChars: JSON.stringify(responseData).length,
+        inputTokens: promptTokens,
+        outputTokens: candidateTokens,
+        inputEstimated: typeof promptTokens !== 'number',
+        outputEstimated: typeof candidateTokens !== 'number'
+      });
+
+      return { success: true, proposedRule: validation.rule };
     }
   };
 }

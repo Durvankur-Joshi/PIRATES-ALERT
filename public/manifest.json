@@ -1,11 +1,16 @@
 {
   "manifest_version": 3,
   "name": "PIRATES ALERT",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AI-assisted product search results extractor.",
   "permissions": [
     "activeTab",
+    "tabs",
     "storage"
+  ],
+  "host_permissions": [
+    "http://localhost:3001/*",
+    "http://127.0.0.1:3001/*"
   ],
   "action": {
     "default_popup": "popup.html",

@@ -1,20 +1,42 @@
 import { MESSAGE_TYPES, EXTRACTION_SOURCE } from '../modules/messaging/protocol.js';
 import { extractionEngine } from '../modules/extractor/index.js';
-import { rulesRepository, computeLayoutFingerprint } from '../modules/rules/index.js';
+import { rulesRepository, computeLayoutFingerprint, normalizeHostname } from '../modules/rules/index.js';
 import { validateRuleAgainstDoc } from '../modules/rules/validator.js';
 import { aiLearning, getAiLogs } from '../modules/ai/index.js';
 import { preferencesRepository } from '../modules/preferences/index.js';
 import { correctionsRepository, deduceFieldSelectorFromCard } from '../modules/corrections/index.js';
 import { regressionRepository } from '../modules/regression/index.js';
+import { sampleCardSnippetsForAi, hasProductListingEvidence } from '../modules/extractor/cardDetector.js';
+
+let isExtractionBusy = false;
+let isLearningBusy = false;
+
+const VALID_MESSAGE_TYPES = new Set(Object.values(MESSAGE_TYPES));
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') {
     return false;
   }
 
+  if (!VALID_MESSAGE_TYPES.has(message.type)) {
+    sendResponse({ success: false, error: 'Invalid or unsupported message type' });
+    return false;
+  }
+
+  try {
+    const serialized = JSON.stringify(message);
+    if (serialized.length > 100 * 1024) {
+      sendResponse({ success: false, error: 'Message payload exceeds maximum allowed size (100KB)' });
+      return false;
+    }
+  } catch {
+    sendResponse({ success: false, error: 'Malformed message payload' });
+    return false;
+  }
+
   const url = window.location.href;
   const title = document.title;
-  const hostname = window.location.hostname;
+  const hostname = normalizeHostname(window.location.hostname);
   const layoutFingerprint = computeLayoutFingerprint(document, hostname);
 
   if (message.type === MESSAGE_TYPES.GET_PAGE_INFO) {
@@ -27,6 +49,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       const effectivePreferences = await preferencesRepository.getEffectivePreferences(hostname);
+      const hasListing = hasProductListingEvidence(document);
 
       sendResponse({
         url,
@@ -36,6 +59,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         hasSavedRule: isActuallyValid,
         savedRuleId: isActuallyValid ? savedRule.id : null,
         activeVersionId: isActuallyValid ? savedRule.activeVersionId : null,
+        hasListingEvidence: hasListing,
+        canLearnWithAi: !isActuallyValid && hasListing,
         effectivePreferences,
         status: 'READY'
       });
@@ -44,6 +69,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === MESSAGE_TYPES.EXTRACT_PRODUCTS) {
+    if (isExtractionBusy) {
+      sendResponse({
+        success: false,
+        status: 'BUSY',
+        message: 'Extraction is currently in progress. Please wait.'
+      });
+      return false;
+    }
+
+    isExtractionBusy = true;
     (async () => {
       try {
         let extractionRule = null;
@@ -92,8 +127,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         }
 
-        const isUnambiguous = result.items.length > 0 && result.diagnostics?.fieldDiagnostics?.title?.fillRate >= 80;
-        const canLearnWithAi = (!isUnambiguous || result.items.length === 0) && source !== EXTRACTION_SOURCE.SAVED_RULE;
+        const hasListing = result.items.length > 0 || (result.diagnostics?.candidateCount > 0) || hasProductListingEvidence(document);
+        const isUnambiguous = result.items.length > 0 && (result.diagnostics?.fieldDiagnostics?.title?.fillRate || 0) >= 80;
+        const canLearnWithAi = source !== EXTRACTION_SOURCE.SAVED_RULE && hasListing;
 
         sendResponse({
           success: true,
@@ -102,7 +138,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           appliedRuleId,
           layoutFingerprint,
           effectivePreferences,
-          canLearnWithAi
+          hasListingEvidence: hasListing,
+          canLearnWithAi,
+          isUnambiguous
         });
       } catch (err) {
         sendResponse({
@@ -115,6 +153,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             candidateCount: 0,
             acceptedCount: 0,
             rejectedCount: 0,
+            rejectionReasons: { missing_identity: 0, duplicate_url: 0, duplicate_id: 0 },
+            truncated: false,
             discoveryMethod: 'none',
             fieldDiagnostics: {}
           },
@@ -125,46 +165,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             timestamp: new Date().toISOString()
           }
         });
+      } finally {
+        isExtractionBusy = false;
       }
     })();
     return true;
   }
 
   if (message.type === MESSAGE_TYPES.AI_LEARN_LAYOUT) {
+    if (isLearningBusy) {
+      sendResponse({
+        success: false,
+        error: 'AI learning request is already in progress. Please wait.'
+      });
+      return false;
+    }
+
+    isLearningBusy = true;
     (async () => {
       try {
-        const candidateCards = Array.from(document.querySelectorAll(
-          '[class*="product"], [class*="item"], [class*="result"], [data-asin], [data-pid], article, li'
-        )).slice(0, 4);
+        const { candidateSelectors, domSnippets } = sampleCardSnippetsForAi(document, 2, 2500);
 
-        const domSnippets = candidateCards.map((el) => el.outerHTML).filter(Boolean);
-
-        const aiResult = await aiLearning.learnLayout({
-          hostname,
-          pageTitle: title,
-          candidateSelectors: candidateCards.map((el) => el.className ? `.${el.className.split(' ').join('.')}` : el.tagName.toLowerCase()),
-          diagnostics: message.diagnostics || {},
-          domSnippets,
-          callReason: message.callReason || 'heuristics_insufficient'
-        });
-
-        if (!aiResult.success) {
+        if (!domSnippets || domSnippets.length === 0) {
           sendResponse({
             success: false,
-            error: aiResult.error
+            error: 'No product card or listing elements could be isolated on this page for AI learning.'
           });
           return;
         }
 
-        const proposedRule = {
-          hostname,
-          layoutFingerprint,
-          cardSelector: aiResult.proposedRule.cardSelector,
-          fieldSelectors: aiResult.proposedRule.fieldSelectors,
-          confidence: aiResult.proposedRule.confidence
-        };
+        let proposedRule = null;
+        let validation = null;
+        let lastError = null;
+        const MAX_ATTEMPTS = 3;
+        let feedback = null;
 
-        const validation = validateRuleAgainstDoc(proposedRule, document, url);
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          const aiResult = await aiLearning.learnLayout({
+            hostname,
+            pageTitle: title,
+            candidateSelectors,
+            diagnostics: message.diagnostics || {},
+            domSnippets,
+            callReason: message.callReason || 'heuristics_insufficient',
+            feedback
+          });
+
+          if (!aiResult.success) {
+            lastError = aiResult.error;
+            break;
+          }
+
+          proposedRule = {
+            hostname,
+            layoutFingerprint,
+            cardSelector: aiResult.proposedRule.cardSelector,
+            fieldSelectors: aiResult.proposedRule.fieldSelectors,
+            confidence: aiResult.proposedRule.confidence
+          };
+
+          validation = validateRuleAgainstDoc(proposedRule, document, url);
+
+          if (validation.valid) {
+            break;
+          }
+
+          if (attempt < MAX_ATTEMPTS && validation.invalidFields && validation.invalidFields.length > 0) {
+            const invalidFields = [...validation.invalidFields];
+            if (validation.acceptedCount === 0 && !invalidFields.includes('cardSelector')) {
+              invalidFields.unshift('cardSelector');
+            }
+            feedback = {
+              attempt,
+              failedCardSelector: proposedRule.cardSelector,
+              failedFieldSelectors: proposedRule.fieldSelectors,
+              invalidFields,
+              errors: validation.errors
+            };
+          }
+        }
+
+        if (!proposedRule && lastError) {
+          sendResponse({
+            success: false,
+            error: lastError
+          });
+          return;
+        }
 
         sendResponse({
           success: true,
@@ -176,6 +263,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           success: false,
           error: err?.message || 'AI layout learning failed'
         });
+      } finally {
+        isLearningBusy = false;
       }
     })();
     return true;

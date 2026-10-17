@@ -9,7 +9,9 @@ import {
   extractProductId,
   extractTitle,
   extractProductUrl,
-  extractExtraAttributes
+  extractExtraAttributes,
+  extractPriceFromElement,
+  queryCardElement
 } from './utils.js';
 import { findProductCards } from './cardDetector.js';
 
@@ -17,7 +19,7 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   let title = null;
   if (rule.titleSelector) {
     try {
-      const el = cardEl.querySelector(rule.titleSelector);
+      const el = queryCardElement(cardEl, rule.titleSelector, rule.cardSelector);
       if (el) {
         title = normalizeText(el.textContent);
       }
@@ -30,9 +32,12 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   let product_url = null;
   if (rule.urlSelector) {
     try {
-      const el = cardEl.querySelector(rule.urlSelector);
-      if (el && el.getAttribute('href')) {
-        product_url = resolveAbsoluteUrl(el.getAttribute('href'), baseUrl);
+      const el = queryCardElement(cardEl, rule.urlSelector, rule.cardSelector);
+      if (el) {
+        const href = el.getAttribute('href') || (el.closest ? el.closest('a')?.getAttribute('href') : null);
+        if (href) {
+          product_url = resolveAbsoluteUrl(href, baseUrl);
+        }
       }
     } catch {}
   }
@@ -45,7 +50,7 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   let image_url = null;
   if (rule.imageSelector) {
     try {
-      const el = cardEl.querySelector(rule.imageSelector);
+      const el = queryCardElement(cardEl, rule.imageSelector, rule.cardSelector);
       if (el) {
         image_url = extractImageUrl(el, baseUrl);
       }
@@ -58,9 +63,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   let priceData = null;
   if (rule.priceSelector) {
     try {
-      const el = cardEl.querySelector(rule.priceSelector);
+      const el = queryCardElement(cardEl, rule.priceSelector, rule.cardSelector);
       if (el) {
-        const parsed = parseCurrencyAndPrice(el.textContent);
+        const parsed = extractPriceFromElement(el, true);
         if (parsed.price !== null) {
           priceData = {
             selling_price: parsed.price,
@@ -68,9 +73,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
             currency: parsed.currency
           };
           if (rule.mrpSelector) {
-            const mrpEl = cardEl.querySelector(rule.mrpSelector);
+            const mrpEl = queryCardElement(cardEl, rule.mrpSelector, rule.cardSelector);
             if (mrpEl) {
-              const mrpParsed = parseCurrencyAndPrice(mrpEl.textContent);
+              const mrpParsed = extractPriceFromElement(mrpEl, false);
               if (mrpParsed.price !== null) {
                 priceData.mrp = mrpParsed.price;
                 if (!priceData.currency) priceData.currency = mrpParsed.currency;
@@ -85,10 +90,16 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
     priceData = distinguishPrices(cardEl);
   }
 
+  if (priceData.selling_price !== null && priceData.mrp !== null && priceData.selling_price > priceData.mrp) {
+    const temp = priceData.selling_price;
+    priceData.selling_price = priceData.mrp;
+    priceData.mrp = temp;
+  }
+
   let rating = null;
   if (rule.ratingSelector) {
     try {
-      const el = cardEl.querySelector(rule.ratingSelector);
+      const el = queryCardElement(cardEl, rule.ratingSelector, rule.cardSelector);
       if (el) {
         rating = parseRating(el);
       }
@@ -188,29 +199,37 @@ export function createExtractionEngine(config = {}) {
         };
       }
 
-      const { candidateCards, method } = findProductCards(doc, rule.cardSelector);
+      const { candidateCards, method, truncated } = findProductCards(doc, rule.cardSelector);
       const candidateCount = candidateCards.length;
 
       const acceptedItems = [];
       const seenUrls = new Set();
       const seenIds = new Set();
       let rejectedCount = 0;
+      const rejectionReasons = {
+        missing_identity: 0,
+        duplicate_url: 0,
+        duplicate_id: 0
+      };
 
       for (const cardEl of candidateCards) {
         const item = extractProductFromCard(cardEl, url, rule);
 
         if (!item.title || (item.selling_price === null && item.image_url === null)) {
           rejectedCount += 1;
+          rejectionReasons.missing_identity += 1;
           continue;
         }
 
         if (item.product_url && seenUrls.has(item.product_url)) {
           rejectedCount += 1;
+          rejectionReasons.duplicate_url += 1;
           continue;
         }
 
         if (item.product_id && seenIds.has(item.product_id)) {
           rejectedCount += 1;
+          rejectionReasons.duplicate_id += 1;
           continue;
         }
 
@@ -249,6 +268,8 @@ export function createExtractionEngine(config = {}) {
           candidateCount,
           acceptedCount,
           rejectedCount,
+          rejectionReasons,
+          truncated: Boolean(truncated),
           discoveryMethod: method,
           fieldDiagnostics
         },
