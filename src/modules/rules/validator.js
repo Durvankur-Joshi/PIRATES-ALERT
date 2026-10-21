@@ -22,7 +22,7 @@ const DISALLOWED_CARD_SELECTORS = new Set([
   '.col-12', 'div.col-12', '.col-12-12', 'div.col-12-12', '.col-10-12', 'div.col-10-12'
 ]);
 
-function testCssSyntax(selector, rootDoc) {
+export function testCssSyntax(selector, rootDoc) {
   if (!selector || typeof selector !== 'string') return false;
   const trimmed = selector.trim();
   if (trimmed.length < 1 || trimmed.length > 250) return false;

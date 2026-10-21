@@ -38,14 +38,12 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState(EXTRACTION_STATUS.CONNECTING);
   const [statusMessage, setStatusMessage] = useState('Querying active tab and content script...');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isLearning, setIsLearning] = useState(false);
   const [activeTabId, setActiveTabId] = useState(null);
   const [extractionResult, setExtractionResult] = useState(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [activeView, setActiveView] = useState('main');
   const [downloadSuccess, setDownloadSuccess] = useState(false);
 
-  const [aiProposal, setAiProposal] = useState(null);
   const [learningError, setLearningError] = useState(null);
 
   const [savedRules, setSavedRules] = useState([]);
@@ -61,6 +59,15 @@ export default function App() {
 
   const [expandedRuleId, setExpandedRuleId] = useState(null);
   const [ruleHistories, setRuleHistories] = useState({});
+
+  const [selectorField, setSelectorField] = useState('sellingPrice');
+  const [proposedSelector, setProposedSelector] = useState('');
+  const [selectorPreview, setSelectorPreview] = useState(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [isApplyingCorrection, setIsApplyingCorrection] = useState(false);
+  const [userConfirmedAmbiguity, setUserConfirmedAmbiguity] = useState(false);
+  const [isPickingElement, setIsPickingElement] = useState(false);
+  const [selectorCorrectionMsg, setSelectorCorrectionMsg] = useState(null);
 
   useEffect(() => {
     async function initPageConnection() {
@@ -179,7 +186,6 @@ export default function App() {
       if (chrome.tabs?.onActivated) {
         onActivated = () => {
           setExtractionResult(null);
-          setAiProposal(null);
           setLearningError(null);
           initPageConnection();
         };
@@ -221,7 +227,15 @@ export default function App() {
   async function handleExtractClick() {
     if (isProcessing) return;
     setIsProcessing(true);
-    setStatusMessage('Scanning DOM and running extraction pipeline...');
+    setLearningError(null);
+
+    if (pageInfo.hasSavedRule) {
+      setStatusMessage('Checking saved layout rule...');
+    } else if (pageInfo.hasListingEvidence) {
+      setStatusMessage('No saved rule. Detecting layout and learning automatically...');
+    } else {
+      setStatusMessage('Scanning DOM and running extraction pipeline...');
+    }
 
     if (!isExtensionEnvironment()) {
       setTimeout(() => {
@@ -231,7 +245,7 @@ export default function App() {
           source: EXTRACTION_SOURCE.HEURISTIC,
           message: 'Preview mode: No product listing detected in standalone popup window.',
           items: [],
-          canLearnWithAi: true,
+          canLearnWithAi: false,
           diagnostics: {
             candidateCount: 0,
             acceptedCount: 0,
@@ -281,10 +295,21 @@ export default function App() {
           )
         }));
       }
+
+      if (data.autoLearnStatus) {
+        const isError = data.autoLearnStatus.toLowerCase().includes('failed') ||
+                        data.autoLearnStatus.toLowerCase().includes('error');
+        if (isError && data.source !== EXTRACTION_SOURCE.SAVED_RULE) {
+          setLearningError(data.autoLearnStatus);
+        }
+      }
+
       if (data.source === EXTRACTION_SOURCE.SAVED_RULE) {
-        setStatusMessage(`Reused saved rule (0 AI calls): Extracted ${data.items?.length || 0} products.`);
+        setStatusMessage(`Using saved layout rule (0 AI calls): Extracted ${data.items?.length || 0} products.`);
+      } else if (data.autoLearnStatus && data.autoLearnStatus.includes('learned and saved')) {
+        setStatusMessage(`Layout learned and saved. Extracted ${data.items?.length || 0} products.`);
       } else {
-        setStatusMessage(data.message || `Extracted ${data.items?.length || 0} products.`);
+        setStatusMessage(data.autoLearnStatus || data.message || `Extracted ${data.items?.length || 0} products.`);
       }
     } else {
       setConnectionStatus(EXTRACTION_STATUS.ERROR);
@@ -292,131 +317,9 @@ export default function App() {
     }
   }
 
-  async function handleStartAiLearning() {
-    if (isLearning) return;
-
-    if (!isExtensionEnvironment()) {
-      setIsLearning(true);
-      setLearningError(null);
-      setAiProposal(null);
-      setStatusMessage('Sampling candidate DOM cards and requesting AI layout proposal...');
-      setTimeout(() => {
-        setIsLearning(false);
-        setAiProposal({
-          proposedRule: {
-            hostname: window.location.hostname || 'preview.local',
-            layoutFingerprint: 'layout_preview',
-            cardSelector: '.preview-product-card',
-            fieldSelectors: {
-              titleSelector: '.preview-title',
-              priceSelector: '.preview-price'
-            },
-            confidence: 0.95
-          },
-          validation: {
-            valid: true,
-            candidateCount: 4,
-            acceptedCount: 4,
-            matchRate: 100,
-            errors: [],
-            warnings: []
-          }
-        });
-        setStatusMessage('AI proposed layout rules. Review validation preview below.');
-      }, 500);
-      return;
-    }
-
-    if (!activeTabId) {
-      setLearningError('No active tab detected for layout learning.');
-      setStatusMessage('No active tab detected for layout learning.');
-      return;
-    }
-
-    setIsLearning(true);
+  async function handleRetryExtraction() {
     setLearningError(null);
-    setAiProposal(null);
-    setStatusMessage('Sampling candidate DOM cards and requesting AI layout proposal...');
-
-    try {
-      const response = await sendMessageToTab(activeTabId, {
-        type: MESSAGE_TYPES.AI_LEARN_LAYOUT,
-        diagnostics: extractionResult?.diagnostics || {},
-        callReason: extractionResult?.items?.length ? 'user_manual_learn' : 'heuristics_insufficient'
-      });
-
-      setIsLearning(false);
-
-      if (response && response.success && response.data?.success) {
-        setAiProposal(response.data);
-        setStatusMessage(
-          response.data.validation?.valid
-            ? 'AI proposed layout rules. Review validation preview below.'
-            : 'AI proposed layout rules, but live validation failed. Review errors below.'
-        );
-      } else {
-        const errMsg = response?.data?.error || response?.error || 'AI learning failed. Is the AI proxy server running?';
-        setLearningError(errMsg);
-        setStatusMessage(errMsg);
-      }
-    } catch (err) {
-      setIsLearning(false);
-      const errMsg = err?.message || 'Failed to communicate with active tab.';
-      setLearningError(errMsg);
-      setStatusMessage(errMsg);
-    }
-  }
-
-  async function handleApplyAndSaveRule() {
-    if (!aiProposal || !aiProposal.proposedRule || !aiProposal.validation?.valid) return;
-
-    if (!isExtensionEnvironment()) {
-      setPageInfo((prev) => ({
-        ...prev,
-        hasSavedRule: true,
-        savedRuleId: 'rule_preview_layout',
-        activeVersionId: 'v1'
-      }));
-      setAiProposal(null);
-      setIsProcessing(false);
-      setStatusMessage('Preview mode: rule saved.');
-      return;
-    }
-
-    if (!activeTabId) return;
-    setIsProcessing(true);
-    setStatusMessage('Saving validated rule and executing extraction...');
-
-    try {
-      const saveResponse = await sendMessageToTab(activeTabId, {
-        type: MESSAGE_TYPES.SAVE_RULE,
-        rule: {
-          ...aiProposal.proposedRule,
-          testResults: aiProposal.validation || {}
-        }
-      });
-
-      if (saveResponse && saveResponse.success && saveResponse.data?.success) {
-        setPageInfo((prev) => ({
-          ...prev,
-          hasSavedRule: true,
-          savedRuleId: saveResponse.data.rule?.id || null,
-          activeVersionId: saveResponse.data.rule?.activeVersionId || null
-        }));
-        setAiProposal(null);
-        setIsProcessing(false);
-        await loadSavedRules();
-        await handleExtractClick();
-      } else {
-        setIsProcessing(false);
-        const errMsg = saveResponse?.data?.error || saveResponse?.error || 'Failed to save rule.';
-        setStatusMessage(errMsg);
-      }
-    } catch (err) {
-      setIsProcessing(false);
-      const errMsg = err?.message || 'Save request failed.';
-      setStatusMessage(errMsg);
-    }
+    await handleExtractClick();
   }
 
   async function loadSavedRules() {
@@ -514,6 +417,117 @@ export default function App() {
     if (res.success) {
       await loadPreferences();
       setStatusMessage(`Saved ${isSite ? 'site' : 'global'} field preferences.`);
+    }
+  }
+
+  async function handleStartElementPicker() {
+    if (!activeTabId) return;
+    setIsPickingElement(true);
+    setStatusMessage('Element picker active: Click an element on the webpage or press Esc to cancel.');
+    try {
+      const res = await sendMessageToTab(activeTabId, {
+        type: MESSAGE_TYPES.START_ELEMENT_PICKER
+      });
+      setIsPickingElement(false);
+      if (res.success && res.data?.selector) {
+        setProposedSelector(res.data.selector);
+        setStatusMessage(`Picked selector: "${res.data.selector}"`);
+      } else if (res.data?.cancelled) {
+        setStatusMessage('Element picker cancelled.');
+      }
+    } catch {
+      setIsPickingElement(false);
+      setStatusMessage('Element picker failed or was cancelled.');
+    }
+  }
+
+  async function handlePreviewSelector() {
+    if (!proposedSelector.trim()) {
+      setSelectorCorrectionMsg({ type: 'error', text: 'Please enter a selector to test.' });
+      return;
+    }
+    setIsPreviewLoading(true);
+    setSelectorCorrectionMsg(null);
+    setUserConfirmedAmbiguity(false);
+
+    if (!isExtensionEnvironment()) {
+      setIsPreviewLoading(false);
+      setSelectorCorrectionMsg({ type: 'info', text: 'Preview is running in development preview mode.' });
+      return;
+    }
+
+    if (!activeTabId) {
+      setIsPreviewLoading(false);
+      setSelectorCorrectionMsg({ type: 'error', text: 'No active tab connected.' });
+      return;
+    }
+
+    const currentCardSelector = extractionResult?.rules?.cardSelector ||
+      pageInfo.cardSelector ||
+      (savedRules.find((r) => r.id === pageInfo.savedRuleId)?.cardSelector);
+
+    const res = await sendMessageToTab(activeTabId, {
+      type: MESSAGE_TYPES.PREVIEW_SELECTOR_CORRECTION,
+      cardSelector: currentCardSelector,
+      field: selectorField,
+      proposedSelector: proposedSelector.trim()
+    });
+
+    setIsPreviewLoading(false);
+
+    if (res.success && res.data?.preview) {
+      setSelectorPreview(res.data.preview);
+    } else {
+      setSelectorCorrectionMsg({ type: 'error', text: res.data?.error || res.error || 'Failed to generate preview.' });
+    }
+  }
+
+  async function handleApplyCorrection() {
+    if (!selectorPreview || !selectorPreview.valid) return;
+    if (selectorPreview.summary.requiresUserConfirmation && !userConfirmedAmbiguity) {
+      setSelectorCorrectionMsg({
+        type: 'error',
+        text: 'You must check the confirmation box before saving this ambiguous or likely-MRP selector.'
+      });
+      return;
+    }
+
+    setIsApplyingCorrection(true);
+    setSelectorCorrectionMsg(null);
+
+    const currentCardSelector = selectorPreview.cardSelector;
+
+    const res = await sendMessageToTab(activeTabId, {
+      type: MESSAGE_TYPES.APPLY_SELECTOR_CORRECTION,
+      cardSelector: currentCardSelector,
+      field: selectorField,
+      proposedSelector: proposedSelector.trim(),
+      userConfirmedAmbiguity
+    });
+
+    setIsApplyingCorrection(false);
+
+    if (res.success && res.data?.success) {
+      const updatedRule = res.data.rule;
+      setSelectorCorrectionMsg({
+        type: 'success',
+        text: `Successfully updated rule! New active version is ${updatedRule.activeVersionId} (${updatedRule.versions?.length || 1} versions saved).`
+      });
+      setPageInfo((prev) => ({
+        ...prev,
+        hasSavedRule: true,
+        savedRuleId: updatedRule.id,
+        activeVersionId: updatedRule.activeVersionId
+      }));
+      await loadSavedRules();
+      if (updatedRule.id) {
+        await toggleRuleHistory(updatedRule.id);
+      }
+    } else {
+      setSelectorCorrectionMsg({
+        type: 'error',
+        text: res.data?.error || res.error || 'Failed to activate correction.'
+      });
     }
   }
 
@@ -624,18 +638,6 @@ export default function App() {
       pageInfo.hasListingEvidence
     );
 
-  const showLearnWithAi =
-    isSupportedPage &&
-    pageHasListingEvidence &&
-    !pageInfo.hasSavedRule &&
-    extractionResult?.source !== EXTRACTION_SOURCE.SAVED_RULE;
-
-  const isHeuristicUnambiguous =
-    !pageInfo.hasSavedRule &&
-    extractionResult?.source === EXTRACTION_SOURCE.HEURISTIC &&
-    items.length > 0 &&
-    (extractionResult?.isUnambiguous || (fieldDiagnostics?.title?.fillRate || 0) >= 80);
-
   return (
     <div className="popup-container">
       <header className="header">
@@ -684,6 +686,15 @@ export default function App() {
           >
             Prefs
           </button>
+          <button
+            className={`nav-tab-btn ${activeView === 'selectors' ? 'active' : ''}`}
+            onClick={() => {
+              setActiveView('selectors');
+              loadSavedRules();
+            }}
+          >
+            Selectors
+          </button>
         </div>
       </header>
 
@@ -711,15 +722,6 @@ export default function App() {
                 <span>
                   Saved Rule Active: <strong>{pageInfo.savedRuleId}</strong> ({pageInfo.activeVersionId || 'v1'}) (0 AI calls)
                 </span>
-                <button
-                  id="btn-relearn-rule"
-                  className="btn-relearn"
-                  onClick={handleStartAiLearning}
-                  disabled={isLearning || isProcessing}
-                  title="Explicitly re-learn and update the rule for this layout"
-                >
-                  {isLearning ? 'Learning...' : 'Re-learn with AI'}
-                </button>
               </div>
             )}
           </section>
@@ -729,7 +731,7 @@ export default function App() {
               id="btn-extract-products"
               className="btn-extract"
               onClick={handleExtractClick}
-              disabled={isProcessing || isLearning || connectionStatus === EXTRACTION_STATUS.UNAVAILABLE}
+              disabled={isProcessing || connectionStatus === EXTRACTION_STATUS.UNAVAILABLE}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="11" cy="11" r="8"></circle>
@@ -738,20 +740,22 @@ export default function App() {
               <span>{isProcessing ? 'Extracting...' : items.length > 0 ? 'Re-extract' : 'Extract Products'}</span>
             </button>
 
-            {showLearnWithAi && (
-              <button
-                id="btn-ai-learn"
-                className="btn-ai-learn"
-                onClick={handleStartAiLearning}
-                disabled={isLearning || isProcessing}
-                title="Use AI to discover selectors for this layout"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-                </svg>
-                <span>{isLearning ? 'Learning...' : 'Learn with AI'}</span>
-              </button>
-            )}
+            <button
+              id="btn-correct-selector"
+              className="btn-extract"
+              style={{ background: 'var(--surface-color, #1e293b)', border: '1px solid #334155' }}
+              onClick={() => {
+                setActiveView('selectors');
+                loadSavedRules();
+              }}
+              title="Manual Selector Correction"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+              </svg>
+              <span>Correct Selector</span>
+            </button>
 
             {items.length > 0 && (
               <button
@@ -770,17 +774,6 @@ export default function App() {
             )}
           </div>
 
-          {isHeuristicUnambiguous && (
-            <div className="ai-hint-banner" id="heuristic-unambiguous-hint">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="16" x2="12" y2="12" />
-                <line x1="12" y1="8" x2="12.01" y2="8" />
-              </svg>
-              <span>Heuristics extracted products cleanly. AI learning is optional and creates a reusable rule for this layout.</span>
-            </div>
-          )}
-
           <section className="status-placeholder-card">
             <div className="status-header-row">
               <span className="status-header-title">Status & Engine</span>
@@ -795,6 +788,11 @@ export default function App() {
             <p className="status-message">
               {statusMessage}
             </p>
+            {extractionResult?.autoLearnStatus && !learningError && (
+              <p className="status-message auto-learn-status">
+                {extractionResult.autoLearnStatus}
+              </p>
+            )}
             {diagnostics && (
               <div className="metrics-bar">
                 <span className="metric-item">Candidates: <strong>{diagnostics.candidateCount}</strong></span>
@@ -810,103 +808,6 @@ export default function App() {
             )}
           </section>
 
-          {aiProposal && (
-            <section className="proposal-card" id="ai-proposal-section">
-              <div className="proposal-header">
-                <span className="proposal-title">AI Layout Rule Proposal</span>
-                <span className={`validation-badge ${aiProposal.validation?.valid ? 'valid' : 'invalid'}`}>
-                  {aiProposal.validation?.valid ? 'Validated' : 'Unreliable'}
-                </span>
-              </div>
-              <div className="proposal-content">
-                <div className="proposal-field">
-                  <span className="field-lbl">Card Selector:</span>
-                  <code>{aiProposal.proposedRule?.cardSelector}</code>
-                </div>
-                <div className="proposal-field">
-                  <span className="field-lbl">Title:</span>
-                  <code>{aiProposal.proposedRule?.fieldSelectors?.titleSelector || 'auto'}</code>
-                </div>
-                <div className="proposal-field">
-                  <span className="field-lbl">Price:</span>
-                  <code>{aiProposal.proposedRule?.fieldSelectors?.priceSelector || 'auto'}</code>
-                </div>
-                {aiProposal.proposedRule?.fieldSelectors?.mrpSelector && (
-                  <div className="proposal-field">
-                    <span className="field-lbl">MRP:</span>
-                    <code>{aiProposal.proposedRule.fieldSelectors.mrpSelector}</code>
-                  </div>
-                )}
-                {aiProposal.proposedRule?.fieldSelectors?.urlSelector && (
-                  <div className="proposal-field">
-                    <span className="field-lbl">URL:</span>
-                    <code>{aiProposal.proposedRule.fieldSelectors.urlSelector}</code>
-                  </div>
-                )}
-                {aiProposal.proposedRule?.fieldSelectors?.imageSelector && (
-                  <div className="proposal-field">
-                    <span className="field-lbl">Image:</span>
-                    <code>{aiProposal.proposedRule.fieldSelectors.imageSelector}</code>
-                  </div>
-                )}
-                {aiProposal.proposedRule?.fieldSelectors?.ratingSelector && (
-                  <div className="proposal-field">
-                    <span className="field-lbl">Rating:</span>
-                    <code>{aiProposal.proposedRule.fieldSelectors.ratingSelector}</code>
-                  </div>
-                )}
-                <div className="proposal-stats">
-                  <span>Matched: <strong>{aiProposal.validation?.candidateCount || 0}</strong> cards</span>
-                  <span>Match Rate: <strong>{aiProposal.validation?.matchRate ?? 0}%</strong></span>
-                </div>
-              </div>
-
-              {!aiProposal.validation?.valid && aiProposal.validation?.errors?.length > 0 && (
-                <div className="proposal-errors-banner" id="proposal-validation-errors">
-                  <span className="proposal-errors-title">Saving is blocked because candidate failed validation:</span>
-                  <ul className="proposal-errors-list">
-                    {aiProposal.validation.errors.map((err, idx) => (
-                      <li key={idx}>{err}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <div className="proposal-actions">
-                {aiProposal.validation?.valid ? (
-                  <button
-                    id="btn-save-apply-rule"
-                    className="btn-apply-rule"
-                    onClick={handleApplyAndSaveRule}
-                    disabled={isProcessing}
-                  >
-                    {isProcessing ? 'Saving...' : 'Save & Apply Rule'}
-                  </button>
-                ) : (
-                  <button
-                    id="btn-retry-ai-learn"
-                    className="btn-retry-rule"
-                    onClick={handleStartAiLearning}
-                    disabled={isLearning || isProcessing}
-                  >
-                    {isLearning ? 'Retrying...' : 'Retry Learning'}
-                  </button>
-                )}
-                <button
-                  id="btn-dismiss-proposal"
-                  className="btn-cancel-rule"
-                  onClick={() => {
-                    setAiProposal(null);
-                    setLearningError(null);
-                  }}
-                  disabled={isProcessing}
-                >
-                  {aiProposal.validation?.valid ? 'Dismiss' : 'Cancel'}
-                </button>
-              </div>
-            </section>
-          )}
-
           {learningError && (
             <div className="error-banner" id="ai-learning-error">
               <div className="error-banner-content">
@@ -920,8 +821,8 @@ export default function App() {
               <div className="error-banner-actions">
                 <button
                   className="btn-banner-retry"
-                  onClick={handleStartAiLearning}
-                  disabled={isLearning || isProcessing}
+                  onClick={handleRetryExtraction}
+                  disabled={isProcessing}
                 >
                   Retry
                 </button>
@@ -1046,9 +947,9 @@ export default function App() {
                 {!isSupportedPage
                   ? 'Browser internal and system pages cannot be extracted.'
                   : !pageHasListingEvidence && (extractionResult || !pageInfo.hasListingEvidence)
-                  ? 'This page does not appear to contain a product listing or search results. AI layout learning is unavailable because no product cards, pricing, or product elements were detected.'
+                  ? 'This page does not appear to contain a product listing or search results. No product cards, pricing, or product elements were detected.'
                   : extractionResult
-                  ? 'DOM heuristics could not confidently isolate product cards on this page. Click "Learn with AI" above to deduce extraction rules.'
+                  ? 'DOM heuristics could not confidently isolate product cards on this page. Click "Extract Products" to retry with automatic AI layout learning.'
                   : 'Open any product search results or category listing page and click "Extract Products" to capture structured data.'}
               </p>
             </main>
@@ -1060,43 +961,11 @@ export default function App() {
         <section className="tab-view-container">
           <div className="tab-view-header">
             <span className="tab-view-title">Saved Layout Rules ({savedRules.length})</span>
-            <button
-              id="btn-rules-learn-ai"
-              className="btn-rules-learn"
-              onClick={() => {
-                setActiveView('main');
-                if (!isSupportedPage) {
-                  setStatusMessage('AI learning requires an active HTTP/HTTPS product listing page.');
-                } else if (!pageHasListingEvidence) {
-                  setStatusMessage('This page does not contain product listing evidence. AI learning requires product cards or pricing.');
-                } else {
-                  handleStartAiLearning();
-                }
-              }}
-              title="Learn layout for current page"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-              </svg>
-              <span>Learn with AI</span>
-            </button>
           </div>
           {savedRules.length === 0 ? (
             <div className="tab-empty-state">
               <div className="tab-empty-content">
-                <span>No saved rules yet. Rules are created and saved when you validate an AI layout proposal.</span>
-                {isSupportedPage && pageHasListingEvidence && !pageInfo.hasSavedRule && (
-                  <button
-                    id="btn-empty-rules-learn"
-                    className="btn-rules-learn-empty"
-                    onClick={() => {
-                      setActiveView('main');
-                      handleStartAiLearning();
-                    }}
-                  >
-                    Learn Current Page Layout
-                  </button>
-                )}
+                <span>No saved rules yet. Rules are created automatically when you extract from a supported product listing page.</span>
               </div>
             </div>
           ) : (
@@ -1287,6 +1156,214 @@ export default function App() {
         </section>
       )}
 
+      {activeView === 'selectors' && (
+        <section className="card">
+          <div className="card-label-group">
+            <span className="card-label">Manual Selector Correction</span>
+            <span className="badge-scope">Field-Level</span>
+          </div>
+
+          <div className="correction-field-selector-group">
+            <label className="correction-label">Select Field</label>
+            <select
+              className="correction-select"
+              value={selectorField}
+              onChange={(e) => {
+                setSelectorField(e.target.value);
+                setSelectorPreview(null);
+                setSelectorCorrectionMsg(null);
+              }}
+            >
+              <option value="sellingPrice">sellingPrice (Selling / Deal Price)</option>
+              <option value="mrp">mrp (List Price / MRP)</option>
+              <option value="title">title (Product Title)</option>
+              <option value="product_url">product_url (Product Link)</option>
+              <option value="image_url">image_url (Product Image)</option>
+              <option value="rating">rating (Star Rating)</option>
+            </select>
+          </div>
+
+          <div className="correction-current-selector-info">
+            <span className="info-label">Active Rule Card Selector:</span>
+            <code className="code-badge">
+              {extractionResult?.rules?.cardSelector ||
+                pageInfo.cardSelector ||
+                savedRules.find((r) => r.id === pageInfo.savedRuleId)?.cardSelector ||
+                '.product-card'}
+            </code>
+          </div>
+
+          <div className="correction-input-group">
+            <label className="correction-label">Proposed CSS Selector</label>
+            <div className="selector-input-row">
+              <input
+                type="text"
+                className="correction-input"
+                placeholder={selectorField === 'sellingPrice' ? '.old-price, .sale-price, [data-price]' : '.product-title, a.title'}
+                value={proposedSelector}
+                onChange={(e) => {
+                  setProposedSelector(e.target.value);
+                  setSelectorPreview(null);
+                  setSelectorCorrectionMsg(null);
+                }}
+              />
+              <button
+                type="button"
+                className={`btn-picker ${isPickingElement ? 'picking' : ''}`}
+                onClick={handleStartElementPicker}
+                title="Click an element on the live page"
+              >
+                {isPickingElement ? 'Picking...' : 'Pick on Page'}
+              </button>
+            </div>
+          </div>
+
+          <div className="button-row">
+            <button
+              className="btn-extract"
+              onClick={handlePreviewSelector}
+              disabled={isPreviewLoading || !proposedSelector.trim()}
+            >
+              <span>{isPreviewLoading ? 'Testing...' : 'Test & Preview Selector'}</span>
+            </button>
+          </div>
+
+          {selectorCorrectionMsg && (
+            <div className={`status-banner ${selectorCorrectionMsg.type}`}>
+              <span>{selectorCorrectionMsg.text}</span>
+            </div>
+          )}
+
+          {selectorPreview && (
+            <div className="preview-results-container">
+              <div className="preview-summary-bar">
+                <span className="summary-title">Preview Results:</span>
+                <span className={`summary-badge ${selectorPreview.valid ? 'valid' : 'invalid'}`}>
+                  {selectorPreview.valid ? 'VALID CANDIDATE' : 'INVALID'}
+                </span>
+                <span className="summary-rate">
+                  {selectorPreview.summary.validCount}/{selectorPreview.summary.totalSampled} valid ({selectorPreview.summary.matchRate}%)
+                </span>
+              </div>
+
+              {selectorPreview.errors.length > 0 && (
+                <div className="error-banner">
+                  {selectorPreview.errors.map((err, idx) => (
+                    <div key={idx}>{err}</div>
+                  ))}
+                </div>
+              )}
+
+              {selectorPreview.warnings.length > 0 && (
+                <div className="warning-banner">
+                  {selectorPreview.warnings.map((warn, idx) => (
+                    <div key={idx}>{warn}</div>
+                  ))}
+                </div>
+              )}
+
+              {selectorPreview.summary.requiresUserConfirmation && (
+                <div className="confirmation-box">
+                  <label className="confirm-label">
+                    <input
+                      type="checkbox"
+                      checked={userConfirmedAmbiguity}
+                      onChange={(e) => setUserConfirmedAmbiguity(e.target.checked)}
+                    />
+                    <span>
+                      I explicitly confirm this selector represents the intended {selectorField} despite the detected DOM evidence (e.g. strikethrough / MRP indicators or multiple elements).
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              <div className="sampled-cards-table-container">
+                <table className="sampled-cards-table">
+                  <thead>
+                    <tr>
+                      <th>Card / Identity</th>
+                      <th>Raw Matched Text</th>
+                      <th>Parsed Value</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectorPreview.sampledCards.map((c) => (
+                      <tr key={c.cardIndex} className={`row-${c.validationStatus.toLowerCase()}`}>
+                        <td className="card-identity-cell" title={c.productIdentity}>
+                          <span className="identity-text">{c.productIdentity}</span>
+                          {c.isLikelyMrp && (
+                            <span className="mrp-indicator-tag" title={c.mrpReason || ''}>
+                              Likely MRP
+                            </span>
+                          )}
+                        </td>
+                        <td className="raw-text-cell">{c.rawText !== null ? `"${c.rawText}"` : '—'}</td>
+                        <td className="parsed-value-cell">
+                          {c.parsedValue !== null ? `${c.currency || ''}${c.parsedValue}` : 'null'}
+                        </td>
+                        <td className="status-cell">
+                          <span className={`status-pill pill-${c.validationStatus.toLowerCase()}`}>
+                            {c.validationStatus}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="preview-action-row">
+                <button
+                  className="btn-extract"
+                  onClick={handleApplyCorrection}
+                  disabled={
+                    !selectorPreview.valid ||
+                    (selectorPreview.summary.requiresUserConfirmation && !userConfirmedAmbiguity) ||
+                    isApplyingCorrection
+                  }
+                >
+                  <span>
+                    {isApplyingCorrection ? 'Validating & Persisting...' : 'Confirm & Activate Correction'}
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {pageInfo.savedRuleId && (
+            <div className="rule-rollback-shortcut">
+              <span className="rollback-title">Version History & Rollback:</span>
+              <button
+                className="btn-rollback-toggle"
+                onClick={() => toggleRuleHistory(pageInfo.savedRuleId)}
+              >
+                {expandedRuleId === pageInfo.savedRuleId ? 'Hide Versions' : 'View Rule History'}
+              </button>
+
+              {expandedRuleId === pageInfo.savedRuleId && (
+                <div className="history-drawer-compact">
+                  {(ruleHistories[pageInfo.savedRuleId] || []).map((ver) => (
+                    <div key={ver.versionId} className="history-version-row">
+                      <span className="ver-tag">{ver.versionId} {ver.isActive ? '(Active)' : ''}</span>
+                      <span className="ver-summary">{ver.changeSummary || ver.changeSource}</span>
+                      {!ver.isActive && (
+                        <button
+                          className="btn-rollback"
+                          onClick={() => handleRollback(pageInfo.savedRuleId, ver.versionId)}
+                        >
+                          Rollback
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {editingCard && (
         <div
           className="modal-backdrop"
@@ -1344,9 +1421,9 @@ export default function App() {
           <span className="footer-pill active">Rules</span>
           <span className="footer-pill active">AI</span>
           <span className="footer-pill active">Export</span>
-          <span className="footer-pill active">P5</span>
+          <span className="footer-pill active">Auto</span>
         </div>
-        <span className="footer-meta">v0.5.0 • Phase 5</span>
+        <span className="footer-meta">v0.6.0 • Automatic Learning</span>
       </footer>
     </div>
   );

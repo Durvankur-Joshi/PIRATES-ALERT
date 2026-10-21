@@ -1,4 +1,14 @@
-import { normalizeText, parseCurrencyAndPrice } from '../extractor/utils.js';
+import {
+  normalizeText,
+  parseCurrencyAndPrice,
+  extractPriceFromElement,
+  extractTitle,
+  extractProductId,
+  queryCardElement
+} from '../extractor/utils.js';
+import { testCssSyntax, validateRuleAgainstDoc } from '../rules/validator.js';
+import { rulesRepository } from '../rules/index.js';
+import { regressionRepository } from '../regression/index.js';
 
 const STORAGE_KEY = 'pirates_alert_corrections';
 const MAX_STORED_CORRECTIONS = 100;
@@ -271,3 +281,613 @@ export function deduceFieldSelectorFromCard(cardEl, fieldName, targetValue) {
 }
 
 export const correctionsRepository = createCorrectionsRepository();
+
+const MRP_INDICATOR_REGEX = /(?:old[-_]?price|mrp|list[-_]?price|was[-_]?price|original[-_]?price|strike|del|crossed|regular[-_]?price|previous[-_]?price)/i;
+
+export function detectMrpConfusion(element, cardEl, selector = '') {
+  if (!element) {
+    return { isLikelyMrp: false, reason: null };
+  }
+
+  if (selector && MRP_INDICATOR_REGEX.test(selector)) {
+    return {
+      isLikelyMrp: true,
+      reason: `Selector "${selector}" explicitly targets MRP or list-price styling.`
+    };
+  }
+
+  const tagName = element.tagName ? element.tagName.toLowerCase() : '';
+  if (['del', 's', 'strike'].includes(tagName)) {
+    return {
+      isLikelyMrp: true,
+      reason: `Element has strikethrough markup (<${tagName}>) commonly representing list price or MRP.`
+    };
+  }
+
+  if (typeof element.closest === 'function') {
+    const strikeAncestor = element.closest('del, s, strike, [class*="strike"], [class*="old"], [class*="mrp"], [class*="list-price"], [class*="was-price"]');
+    if (strikeAncestor && strikeAncestor !== cardEl && cardEl.contains(strikeAncestor)) {
+      return {
+        isLikelyMrp: true,
+        reason: 'Element is contained inside a strikethrough or old-price wrapper.'
+      };
+    }
+  }
+
+  const cls = typeof element.className === 'string' ? element.className : '';
+  const id = typeof element.id === 'string' ? element.id : '';
+  const ariaLabel = element.getAttribute ? element.getAttribute('aria-label') || '' : '';
+  const dataPriceType = element.getAttribute ? element.getAttribute('data-price-type') || '' : '';
+  const combinedAttrs = `${cls} ${id} ${ariaLabel} ${dataPriceType}`;
+
+  if (MRP_INDICATOR_REGEX.test(combinedAttrs)) {
+    return {
+      isLikelyMrp: true,
+      reason: 'Element attributes indicate list price, original price, or MRP.'
+    };
+  }
+
+  const styleAttr = element.getAttribute ? element.getAttribute('style') || '' : '';
+  if (/line-through/i.test(styleAttr)) {
+    return {
+      isLikelyMrp: true,
+      reason: 'Element has inline text-decoration: line-through styling.'
+    };
+  }
+
+  const text = element.textContent || '';
+  if (/\b(?:m\.?r\.?p\.?|list\s*price|was:|regular\s*price|orig(?:inal)?\s*price)\b/i.test(text)) {
+    return {
+      isLikelyMrp: true,
+      reason: 'Element text contains MRP or list price prefix.'
+    };
+  }
+
+  const prevSibling = element.previousElementSibling;
+  if (prevSibling && cardEl && cardEl.contains(prevSibling)) {
+    const prevText = prevSibling.textContent || '';
+    if (/\b(?:m\.?r\.?p\.?|list\s*price|was:|orig(?:inal)?\s*price)\b/i.test(prevText)) {
+      return {
+        isLikelyMrp: true,
+        reason: 'Preceding label indicates MRP or previous price context.'
+      };
+    }
+  }
+
+  const prevNode = element.previousSibling;
+  if (prevNode && prevNode.nodeType === 3) {
+    const prevText = prevNode.textContent || '';
+    if (/\b(?:m\.?r\.?p\.?|list\s*price|was:|orig(?:inal)?\s*price)\b/i.test(prevText)) {
+      return {
+        isLikelyMrp: true,
+        reason: 'Preceding text node indicates MRP or previous price context.'
+      };
+    }
+  }
+
+  if (cardEl && typeof cardEl.querySelectorAll === 'function') {
+    const otherPriceEls = Array.from(cardEl.querySelectorAll('[class*="price"], [class*="amount"]')).filter(
+      (el) =>
+        el !== element &&
+        !element.contains(el) &&
+        !el.contains(element) &&
+        !/discount|save|off|badge|shipping|rating/i.test(el.className || '') &&
+        !/%\s*off|save\s/i.test(el.textContent || '') &&
+        (el.textContent || '').trim().length > 0
+    );
+    const thisPriceParsed = extractPriceFromElement(element, true);
+    if (thisPriceParsed && typeof thisPriceParsed.price === 'number') {
+      for (const otherEl of otherPriceEls) {
+        const otherPrice = extractPriceFromElement(otherEl, true);
+        if (otherPrice && typeof otherPrice.price === 'number' && otherPrice.price > 0 && otherPrice.price < thisPriceParsed.price) {
+          const otherCls = typeof otherEl.className === 'string' ? otherEl.className : '';
+          if (/sale|deal|selling|current|special|our[-_]?price/i.test(otherCls)) {
+            return {
+              isLikelyMrp: true,
+              reason: `A lower selling price (${otherPrice.currency || ''}${otherPrice.price}) was detected elsewhere in the card.`
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return { isLikelyMrp: false, reason: null };
+}
+
+export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice', proposedSelector, doc, maxCards = 15 }) {
+  const errors = [];
+  const warnings = [];
+
+  if (!proposedSelector || typeof proposedSelector !== 'string' || proposedSelector.trim().length === 0) {
+    return {
+      valid: false,
+      field,
+      cardSelector: cardSelector || '',
+      proposedSelector: proposedSelector || '',
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: ['Proposed selector cannot be empty'],
+      warnings: []
+    };
+  }
+
+  const trimmedProposed = proposedSelector.trim();
+
+  if (!testCssSyntax(trimmedProposed, doc)) {
+    return {
+      valid: false,
+      field,
+      cardSelector: cardSelector || '',
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: [`Invalid CSS selector syntax or unsafe expression: "${trimmedProposed}"`],
+      warnings: []
+    };
+  }
+
+  if (!cardSelector || typeof cardSelector !== 'string' || cardSelector.trim().length === 0) {
+    return {
+      valid: false,
+      field,
+      cardSelector: '',
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: ['Card selector is required to scope manual selector correction'],
+      warnings: []
+    };
+  }
+
+  const trimmedCardSelector = cardSelector.trim();
+  if (!testCssSyntax(trimmedCardSelector, doc)) {
+    return {
+      valid: false,
+      field,
+      cardSelector: trimmedCardSelector,
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: [`Invalid card selector syntax: "${trimmedCardSelector}"`],
+      warnings: []
+    };
+  }
+
+  if (!doc || typeof doc.querySelectorAll !== 'function') {
+    return {
+      valid: false,
+      field,
+      cardSelector: trimmedCardSelector,
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: ['Document root is missing or invalid'],
+      warnings: []
+    };
+  }
+
+  let matchedCards = [];
+  try {
+    matchedCards = Array.from(doc.querySelectorAll(trimmedCardSelector));
+  } catch (err) {
+    return {
+      valid: false,
+      field,
+      cardSelector: trimmedCardSelector,
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: [`Failed to query card selector: ${err?.message || 'Query error'}`],
+      warnings: []
+    };
+  }
+
+  if (matchedCards.length === 0) {
+    return {
+      valid: false,
+      field,
+      cardSelector: trimmedCardSelector,
+      proposedSelector: trimmedProposed,
+      sampledCards: [],
+      summary: {
+        totalSampled: 0,
+        matchedCount: 0,
+        validCount: 0,
+        missingCount: 0,
+        ambiguousCount: 0,
+        likelyMrpCount: 0,
+        requiresUserConfirmation: false,
+        matchRate: 0
+      },
+      errors: ['Card selector matched 0 elements in current DOM'],
+      warnings: []
+    };
+  }
+
+  let sample = matchedCards.slice(0, maxCards);
+  let globalMatches = [];
+  try {
+    globalMatches = Array.from(doc.querySelectorAll(trimmedProposed));
+  } catch {}
+
+  const globalOutsideMatches = globalMatches.filter(
+    (gm) => !matchedCards.some((card) => card.contains(gm) || card === gm)
+  );
+  const isExclusivelyOutside = globalMatches.length > 0 && globalMatches.length === globalOutsideMatches.length;
+
+  const sampledCards = [];
+  let validCount = 0;
+  let matchedCount = 0;
+  let missingCount = 0;
+  let ambiguousCount = 0;
+  let likelyMrpCount = 0;
+
+  for (let i = 0; i < sample.length; i++) {
+    const cardEl = sample[i];
+    const productTitle = extractTitle(cardEl);
+    const productId = extractProductId(cardEl);
+    const productIdentity = productTitle || (productId ? `ID: ${productId}` : `Product #${i + 1}`);
+
+    let matchesInCard = [];
+    try {
+      matchesInCard = Array.from(cardEl.querySelectorAll(trimmedProposed));
+    } catch {}
+
+    if (matchesInCard.length === 0 && cardEl.matches && cardEl.matches(trimmedProposed)) {
+      matchesInCard = [cardEl];
+    }
+
+    if (matchesInCard.length === 0) {
+      const status = isExclusivelyOutside ? 'OUTSIDE_CARD' : 'MISSING';
+      missingCount += 1;
+      sampledCards.push({
+        cardIndex: i,
+        productIdentity,
+        matched: false,
+        elementCount: 0,
+        rawText: null,
+        parsedValue: null,
+        currency: null,
+        validationStatus: status,
+        isLikelyMrp: false,
+        mrpReason: null,
+        error: status === 'OUTSIDE_CARD' ? 'Selector matches elements outside product cards' : 'No matching element found in product card'
+      });
+      continue;
+    }
+
+    matchedCount += 1;
+    const elementCount = matchesInCard.length;
+    const primaryEl = matchesInCard[0];
+
+    const isContained = cardEl.contains(primaryEl) || cardEl === primaryEl;
+    if (!isContained) {
+      missingCount += 1;
+      sampledCards.push({
+        cardIndex: i,
+        productIdentity,
+        matched: false,
+        elementCount,
+        rawText: null,
+        parsedValue: null,
+        currency: null,
+        validationStatus: 'OUTSIDE_CARD',
+        isLikelyMrp: false,
+        mrpReason: null,
+        error: 'Matched element is not contained inside the product card'
+      });
+      continue;
+    }
+
+    const rawText = normalizeText(primaryEl.textContent);
+    if (!rawText) {
+      missingCount += 1;
+      sampledCards.push({
+        cardIndex: i,
+        productIdentity,
+        matched: true,
+        elementCount,
+        rawText: '',
+        parsedValue: null,
+        currency: null,
+        validationStatus: 'MISSING',
+        isLikelyMrp: false,
+        mrpReason: null,
+        error: 'Matched element contains no text content'
+      });
+      continue;
+    }
+
+    const isPriceField = field === 'sellingPrice' || field === 'selling_price' || field === 'mrp';
+    let parsedValue = null;
+    let currency = null;
+    let isValidVal = false;
+
+    if (isPriceField) {
+      const parsed = extractPriceFromElement(primaryEl, field !== 'mrp');
+      if (parsed.price !== null && typeof parsed.price === 'number' && !isNaN(parsed.price) && parsed.price >= 0) {
+        parsedValue = parsed.price;
+        currency = parsed.currency;
+        isValidVal = true;
+      }
+    } else {
+      parsedValue = rawText;
+      isValidVal = true;
+    }
+
+    if (!isValidVal) {
+      missingCount += 1;
+      sampledCards.push({
+        cardIndex: i,
+        productIdentity,
+        matched: true,
+        elementCount,
+        rawText,
+        parsedValue: null,
+        currency: null,
+        validationStatus: 'INVALID_VALUE',
+        isLikelyMrp: false,
+        mrpReason: null,
+        error: `Could not parse valid ${field} from text "${rawText}"`
+      });
+      continue;
+    }
+
+    const mrpCheck = detectMrpConfusion(primaryEl, cardEl, trimmedProposed);
+    if (mrpCheck.isLikelyMrp) {
+      likelyMrpCount += 1;
+    }
+
+    let validationStatus = 'VALID';
+    let cardError = null;
+
+    if (elementCount > 1) {
+      validationStatus = 'AMBIGUOUS';
+      ambiguousCount += 1;
+      cardError = `Ambiguous: matched ${elementCount} elements within this card.`;
+    } else {
+      validCount += 1;
+    }
+
+    sampledCards.push({
+      cardIndex: i,
+      productIdentity,
+      matched: true,
+      elementCount,
+      rawText,
+      parsedValue,
+      currency,
+      validationStatus,
+      isLikelyMrp: mrpCheck.isLikelyMrp,
+      mrpReason: mrpCheck.reason,
+      error: cardError
+    });
+  }
+
+  const totalSampled = sample.length;
+  const matchRate = totalSampled > 0 ? Math.round((validCount / totalSampled) * 100) : 0;
+  const requiresUserConfirmation = likelyMrpCount > 0 || ambiguousCount > 0;
+
+  if (matchedCount === 0) {
+    if (globalMatches.length > 0) {
+      errors.push(`Proposed selector "${trimmedProposed}" matches elements outside product cards, but 0 elements within them.`);
+    } else {
+      errors.push(`Proposed selector "${trimmedProposed}" matched 0 elements in current DOM.`);
+    }
+  } else if (validCount === 0) {
+    errors.push(`Proposed selector matched elements in ${matchedCount} card(s), but extracted 0 valid ${field} values.`);
+  } else if (matchRate < 50) {
+    errors.push(`Selector match rate is only ${matchRate}% (${validCount}/${totalSampled}). Minimum 50% required across sampled cards.`);
+  }
+
+  if (likelyMrpCount > 0) {
+    warnings.push(`DOM evidence indicates "${trimmedProposed}" targets MRP / list price rather than selling price in ${likelyMrpCount} card(s). User confirmation is required.`);
+  }
+
+  if (ambiguousCount > 0) {
+    warnings.push(`Selector matched multiple elements in ${ambiguousCount} card(s). User confirmation is required.`);
+  }
+
+  const isValid = errors.length === 0 && validCount > 0;
+
+  return {
+    valid: isValid,
+    field,
+    cardSelector: trimmedCardSelector,
+    proposedSelector: trimmedProposed,
+    sampledCards,
+    summary: {
+      totalSampled,
+      matchedCount,
+      validCount,
+      missingCount,
+      ambiguousCount,
+      likelyMrpCount,
+      requiresUserConfirmation,
+      matchRate
+    },
+    errors,
+    warnings
+  };
+}
+
+function createDocFromHtml(html, fallbackDoc) {
+  if (typeof DOMParser !== 'undefined') {
+    return new DOMParser().parseFromString(html, 'text/html');
+  }
+  if (fallbackDoc && fallbackDoc.defaultView && fallbackDoc.defaultView.DOMParser) {
+    return new fallbackDoc.defaultView.DOMParser().parseFromString(html, 'text/html');
+  }
+  if (fallbackDoc && typeof fallbackDoc.implementation?.createHTMLDocument === 'function') {
+    const d = fallbackDoc.implementation.createHTMLDocument();
+    d.documentElement.innerHTML = html;
+    return d;
+  }
+  return null;
+}
+
+export async function applySelectorCorrection({
+  hostname,
+  layoutFingerprint,
+  cardSelector,
+  field = 'sellingPrice',
+  proposedSelector,
+  userConfirmedAmbiguity = false,
+  doc,
+  url = ''
+}) {
+  if (!doc) {
+    return { success: false, error: 'Document root is required for revalidation' };
+  }
+
+  const preview = previewSelectorCorrection({
+    cardSelector,
+    field,
+    proposedSelector,
+    doc
+  });
+
+  if (preview.summary.requiresUserConfirmation && !userConfirmedAmbiguity) {
+    return {
+      success: false,
+      error: 'Likely MRP or ambiguous pricing detected. Explicit user confirmation is required before activating this correction.',
+      preview
+    };
+  }
+
+  if (!preview.valid) {
+    const errorMsg = preview.errors.join('; ') || 'Proposed selector failed validation';
+    return { success: false, error: errorMsg, preview };
+  }
+
+  const FIELD_KEY_MAP = {
+    sellingPrice: 'priceSelector',
+    selling_price: 'priceSelector',
+    mrp: 'mrpSelector',
+    title: 'titleSelector',
+    product_url: 'urlSelector',
+    image_url: 'imageSelector',
+    rating: 'ratingSelector'
+  };
+
+  const targetSelectorKey = FIELD_KEY_MAP[field] || 'priceSelector';
+  const existingRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
+
+  const baseCardSelector = existingRule?.cardSelector || cardSelector?.trim();
+  const baseFieldSelectors = { ...(existingRule?.fieldSelectors || {}) };
+  baseFieldSelectors[targetSelectorKey] = proposedSelector.trim();
+
+  const candidateRule = {
+    ...(existingRule || {}),
+    id: existingRule?.id || `rule_${hostname}_${layoutFingerprint}`,
+    hostname,
+    layoutFingerprint,
+    cardSelector: baseCardSelector,
+    fieldSelectors: baseFieldSelectors,
+    changeSource: 'manual_selector_correction',
+    changeSummary: `Manual correction for ${field}: ${proposedSelector.trim()}`
+  };
+
+  const liveValidation = validateRuleAgainstDoc(candidateRule, doc, url);
+  if (!liveValidation.valid) {
+    return {
+      success: false,
+      error: `Rule failed live DOM validation: ${(liveValidation.errors || []).join('; ')}`,
+      preservedRule: existingRule,
+      preview
+    };
+  }
+
+  const regressionCheck = await regressionRepository.runRegressionOnCandidate(
+    candidateRule,
+    (html) => createDocFromHtml(html, doc)
+  );
+
+  if (!regressionCheck.passed) {
+    return {
+      success: false,
+      error: `Rule failed regression checks: ${(regressionCheck.failures || []).join('; ')}`,
+      preservedRule: existingRule,
+      preview
+    };
+  }
+
+  const saveRes = await rulesRepository.saveRule({
+    ...candidateRule,
+    validationStatus: 'VALIDATED',
+    testResults: liveValidation,
+    regressionResults: regressionCheck
+  });
+
+  if (!saveRes.success) {
+    return {
+      success: false,
+      error: saveRes.error || 'Failed to persist corrected rule version',
+      preservedRule: existingRule,
+      preview
+    };
+  }
+
+  return {
+    success: true,
+    rule: saveRes.rule,
+    previousVersionId: existingRule?.activeVersionId || null,
+    activeVersionId: saveRes.rule?.activeVersionId,
+    preview
+  };
+}
