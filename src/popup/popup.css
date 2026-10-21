@@ -1456,6 +1456,28 @@
   color: var(--text-muted);
 }
 
+.summary-total-cards {
+  font-size: 10px;
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+.correction-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-link-action {
+  background: none;
+  border: none;
+  color: var(--accent-cyan);
+  font-size: 9px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
 .confirmation-box {
   background: rgba(245, 158, 11, 0.1);
   border: 1px solid rgba(245, 158, 11, 0.4);

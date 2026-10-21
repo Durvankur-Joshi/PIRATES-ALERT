@@ -62,12 +62,27 @@ export default function App() {
 
   const [selectorField, setSelectorField] = useState('sellingPrice');
   const [proposedSelector, setProposedSelector] = useState('');
+  const [customCardSelector, setCustomCardSelector] = useState('');
+  const [isPickingCard, setIsPickingCard] = useState(false);
   const [selectorPreview, setSelectorPreview] = useState(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [isApplyingCorrection, setIsApplyingCorrection] = useState(false);
   const [userConfirmedAmbiguity, setUserConfirmedAmbiguity] = useState(false);
   const [isPickingElement, setIsPickingElement] = useState(false);
   const [selectorCorrectionMsg, setSelectorCorrectionMsg] = useState(null);
+
+  const activeDefaultCardSelector =
+    extractionResult?.rules?.cardSelector ||
+    extractionResult?.cardSelector ||
+    pageInfo.cardSelector ||
+    (savedRules.find((r) => r.id === pageInfo.savedRuleId)?.cardSelector) ||
+    '';
+
+  useEffect(() => {
+    if (!customCardSelector && activeDefaultCardSelector) {
+      setCustomCardSelector(activeDefaultCardSelector);
+    }
+  }, [activeDefaultCardSelector]);
 
   useEffect(() => {
     async function initPageConnection() {
@@ -145,6 +160,7 @@ export default function App() {
             hasSavedRule: Boolean(response.data.hasSavedRule),
             savedRuleId: response.data.savedRuleId || null,
             activeVersionId: response.data.activeVersionId || null,
+            cardSelector: response.data.cardSelector || null,
             hasListingEvidence: Boolean(response.data.hasListingEvidence)
           });
           if (response.data.effectivePreferences) {
@@ -420,23 +436,42 @@ export default function App() {
     }
   }
 
-  async function handleStartElementPicker() {
+  async function handleStartElementPicker(mode = 'field') {
     if (!activeTabId) return;
-    setIsPickingElement(true);
-    setStatusMessage('Element picker active: Click an element on the webpage or press Esc to cancel.');
+    if (mode === 'card') {
+      setIsPickingCard(true);
+    } else {
+      setIsPickingElement(true);
+    }
+    setStatusMessage(`Element picker active (${mode === 'card' ? 'Card Container' : 'Field Element'}): Click an element on the webpage or press Esc to cancel.`);
     try {
       const res = await sendMessageToTab(activeTabId, {
-        type: MESSAGE_TYPES.START_ELEMENT_PICKER
+        type: MESSAGE_TYPES.START_ELEMENT_PICKER,
+        mode,
+        cardSelector: customCardSelector.trim()
       });
-      setIsPickingElement(false);
+      if (mode === 'card') {
+        setIsPickingCard(false);
+      } else {
+        setIsPickingElement(false);
+      }
       if (res.success && res.data?.selector) {
-        setProposedSelector(res.data.selector);
-        setStatusMessage(`Picked selector: "${res.data.selector}"`);
+        if (mode === 'card') {
+          setCustomCardSelector(res.data.selector);
+          setStatusMessage(`Picked card container selector: "${res.data.selector}"`);
+        } else {
+          setProposedSelector(res.data.selector);
+          setStatusMessage(`Picked field selector: "${res.data.selector}"`);
+        }
       } else if (res.data?.cancelled) {
         setStatusMessage('Element picker cancelled.');
       }
     } catch {
-      setIsPickingElement(false);
+      if (mode === 'card') {
+        setIsPickingCard(false);
+      } else {
+        setIsPickingElement(false);
+      }
       setStatusMessage('Element picker failed or was cancelled.');
     }
   }
@@ -446,6 +481,13 @@ export default function App() {
       setSelectorCorrectionMsg({ type: 'error', text: 'Please enter a selector to test.' });
       return;
     }
+
+    const currentCardSelector = (customCardSelector && customCardSelector.trim()) || activeDefaultCardSelector;
+    if (!currentCardSelector) {
+      setSelectorCorrectionMsg({ type: 'error', text: 'Card selector is required to scope manual selector correction. Please enter or pick a card container selector.' });
+      return;
+    }
+
     setIsPreviewLoading(true);
     setSelectorCorrectionMsg(null);
     setUserConfirmedAmbiguity(false);
@@ -461,10 +503,6 @@ export default function App() {
       setSelectorCorrectionMsg({ type: 'error', text: 'No active tab connected.' });
       return;
     }
-
-    const currentCardSelector = extractionResult?.rules?.cardSelector ||
-      pageInfo.cardSelector ||
-      (savedRules.find((r) => r.id === pageInfo.savedRuleId)?.cardSelector);
 
     const res = await sendMessageToTab(activeTabId, {
       type: MESSAGE_TYPES.PREVIEW_SELECTOR_CORRECTION,
@@ -495,7 +533,7 @@ export default function App() {
     setIsApplyingCorrection(true);
     setSelectorCorrectionMsg(null);
 
-    const currentCardSelector = selectorPreview.cardSelector;
+    const currentCardSelector = selectorPreview.cardSelector || (customCardSelector && customCardSelector.trim()) || activeDefaultCardSelector;
 
     const res = await sendMessageToTab(activeTabId, {
       type: MESSAGE_TYPES.APPLY_SELECTOR_CORRECTION,
@@ -1183,23 +1221,54 @@ export default function App() {
             </select>
           </div>
 
-          <div className="correction-current-selector-info">
-            <span className="info-label">Active Rule Card Selector:</span>
-            <code className="code-badge">
-              {extractionResult?.rules?.cardSelector ||
-                pageInfo.cardSelector ||
-                savedRules.find((r) => r.id === pageInfo.savedRuleId)?.cardSelector ||
-                '.product-card'}
-            </code>
-          </div>
-
           <div className="correction-input-group">
-            <label className="correction-label">Proposed CSS Selector</label>
+            <div className="correction-label-row">
+              <label className="correction-label">Card Container CSS Selector</label>
+              {activeDefaultCardSelector && customCardSelector !== activeDefaultCardSelector && (
+                <button
+                  type="button"
+                  className="btn-link-action"
+                  onClick={() => {
+                    setCustomCardSelector(activeDefaultCardSelector);
+                    setSelectorPreview(null);
+                    setSelectorCorrectionMsg(null);
+                  }}
+                  title="Reset to active rule card selector"
+                >
+                  Reset ({activeDefaultCardSelector})
+                </button>
+              )}
+            </div>
             <div className="selector-input-row">
               <input
                 type="text"
                 className="correction-input"
-                placeholder={selectorField === 'sellingPrice' ? '.old-price, .sale-price, [data-price]' : '.product-title, a.title'}
+                placeholder=".product-card, article.item, li.grid-item"
+                value={customCardSelector}
+                onChange={(e) => {
+                  setCustomCardSelector(e.target.value);
+                  setSelectorPreview(null);
+                  setSelectorCorrectionMsg(null);
+                }}
+              />
+              <button
+                type="button"
+                className={`btn-picker ${isPickingCard ? 'picking' : ''}`}
+                onClick={() => handleStartElementPicker('card')}
+                title="Click a repeated product card container on the live page"
+              >
+                {isPickingCard ? 'Picking...' : 'Pick Card'}
+              </button>
+            </div>
+          </div>
+
+          <div className="correction-input-group">
+            <label className="correction-label">Proposed Field CSS Selector ({selectorField})</label>
+            <div className="selector-input-row">
+              <input
+                type="text"
+                className="correction-input"
+                placeholder={selectorField === 'sellingPrice' ? '.old-price, .sale-price, [data-price]' : selectorField === 'title' ? '.product-title, a.title, p.name' : '.field-value'}
                 value={proposedSelector}
                 onChange={(e) => {
                   setProposedSelector(e.target.value);
@@ -1210,10 +1279,10 @@ export default function App() {
               <button
                 type="button"
                 className={`btn-picker ${isPickingElement ? 'picking' : ''}`}
-                onClick={handleStartElementPicker}
+                onClick={() => handleStartElementPicker('field')}
                 title="Click an element on the live page"
               >
-                {isPickingElement ? 'Picking...' : 'Pick on Page'}
+                {isPickingElement ? 'Picking...' : 'Pick Field'}
               </button>
             </div>
           </div>
@@ -1243,6 +1312,9 @@ export default function App() {
                 </span>
                 <span className="summary-rate">
                   {selectorPreview.summary.validCount}/{selectorPreview.summary.totalSampled} valid ({selectorPreview.summary.matchRate}%)
+                </span>
+                <span className="summary-total-cards">
+                  Matched {selectorPreview.summary.totalMatchedCards ?? selectorPreview.summary.totalSampled} cards
                 </span>
               </div>
 
@@ -1282,7 +1354,7 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Card / Identity</th>
-                      <th>Raw Matched Text</th>
+                      <th>{selectorField === 'title' ? 'Raw Matched Title' : 'Raw Matched Text'}</th>
                       <th>Parsed Value</th>
                       <th>Status</th>
                     </tr>
@@ -1298,9 +1370,9 @@ export default function App() {
                             </span>
                           )}
                         </td>
-                        <td className="raw-text-cell">{c.rawText !== null ? `"${c.rawText}"` : '—'}</td>
+                        <td className="raw-text-cell">{c.rawText !== null && c.rawText !== undefined ? `"${c.rawText}"` : '—'}</td>
                         <td className="parsed-value-cell">
-                          {c.parsedValue !== null ? `${c.currency || ''}${c.parsedValue}` : 'null'}
+                          {c.parsedValue !== null && c.parsedValue !== undefined ? `${c.currency || ''}${c.parsedValue}` : 'null'}
                         </td>
                         <td className="status-cell">
                           <span className={`status-pill pill-${c.validationStatus.toLowerCase()}`}>

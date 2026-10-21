@@ -214,6 +214,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         hasSavedRule: isActuallyValid,
         savedRuleId: isActuallyValid ? savedRule.id : null,
         activeVersionId: isActuallyValid ? savedRule.activeVersionId : null,
+        cardSelector: isActuallyValid ? savedRule.cardSelector : null,
         hasListingEvidence: hasListing,
         canLearnWithAi: !isActuallyValid && hasListing,
         effectivePreferences,
@@ -383,6 +384,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           source,
           appliedRuleId,
           layoutFingerprint,
+          cardSelector: extractionRule?.cardSelector || null,
           effectivePreferences,
           hasListingEvidence: hasListing,
           canLearnWithAi: false,
@@ -752,7 +754,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         const currentRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
-        const cardSelector = message.cardSelector || currentRule?.cardSelector;
+        const cardSelector = (message.cardSelector && message.cardSelector.trim()) || currentRule?.cardSelector;
         const preview = previewSelectorCorrection({
           cardSelector,
           field: message.field || 'sellingPrice',
@@ -771,7 +773,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         const currentRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
-        const cardSelector = message.cardSelector || currentRule?.cardSelector;
+        const cardSelector = (message.cardSelector && message.cardSelector.trim()) || currentRule?.cardSelector;
         const res = await applySelectorCorrection({
           hostname,
           layoutFingerprint,
@@ -793,6 +795,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === MESSAGE_TYPES.START_ELEMENT_PICKER) {
     removePickerListeners();
     activePickerCallback = sendResponse;
+    activePickerMode = message.mode || 'field';
+    activePickerCardSelector = message.cardSelector ? message.cardSelector.trim() : '';
     document.addEventListener('mousemove', onPickerMouseMove, true);
     document.addEventListener('click', onPickerClick, true);
     document.addEventListener('keydown', onPickerKeyDown, true);
@@ -813,6 +817,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 let activePickerCallback = null;
+let activePickerMode = 'field';
+let activePickerCardSelector = '';
 
 function removePickerListeners() {
   document.removeEventListener('mousemove', onPickerMouseMove, true);
@@ -832,6 +838,72 @@ function onPickerMouseMove(e) {
     prev.classList.remove('pirates-alert-highlight');
   }
   target.classList.add('pirates-alert-highlight');
+}
+
+function deriveContainerSelector(targetEl) {
+  if (!targetEl || targetEl === document.body || targetEl === document.documentElement) return '';
+
+  let cur = targetEl;
+  let depth = 0;
+
+  while (cur && cur !== document.body && cur !== document.documentElement && depth < 6) {
+    for (const attr of ['data-test', 'data-testid', 'data-component-type', 'data-item-id', 'data-card-id', 'data-qa']) {
+      const val = cur.getAttribute(attr);
+      if (val) {
+        const sel = `[${attr}="${val}"]`;
+        try {
+          const matched = document.querySelectorAll(sel);
+          if (matched.length >= 2 && matched.length <= 150) return sel;
+        } catch {}
+      }
+    }
+
+    if (cur.className && typeof cur.className === 'string') {
+      const classes = cur.className.split(/\s+/).filter((c) => c && !c.startsWith('pirates-alert-'));
+      for (const cls of classes) {
+        if (/header|footer|navbar|nav|search|sidebar|filter|toolbar|wrapper|overlay|modal/i.test(cls)) continue;
+        const sel = `.${cls}`;
+        try {
+          const matched = document.querySelectorAll(sel);
+          if (matched.length >= 2 && matched.length <= 150) {
+            return sel;
+          }
+        } catch {}
+      }
+      if (classes.length > 0) {
+        const tag = cur.tagName.toLowerCase();
+        for (const cls of classes) {
+          const sel = `${tag}.${cls}`;
+          try {
+            const matched = document.querySelectorAll(sel);
+            if (matched.length >= 2 && matched.length <= 150) {
+              return sel;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    const tag = cur.tagName.toLowerCase();
+    if (tag === 'article' || tag === 'li') {
+      try {
+        const matched = document.querySelectorAll(tag);
+        if (matched.length >= 2 && matched.length <= 150) {
+          return tag;
+        }
+      } catch {}
+    }
+
+    cur = cur.parentElement;
+    depth++;
+  }
+
+  if (targetEl.className && typeof targetEl.className === 'string') {
+    const firstCls = targetEl.className.split(/\s+/).filter((c) => c && !c.startsWith('pirates-alert-'))[0];
+    if (firstCls) return `.${firstCls}`;
+  }
+
+  return targetEl.tagName.toLowerCase();
 }
 
 function deriveCardRelativeSelector(targetEl, cardEl) {
@@ -884,13 +956,27 @@ function onPickerClick(e) {
   e.stopPropagation();
   const target = e.target;
   const cb = activePickerCallback;
+  const pickerMode = activePickerMode;
+  const scopedCardSelector = activePickerCardSelector;
   activePickerCallback = null;
   removePickerListeners();
   if (!cb) return;
 
+  if (pickerMode === 'card') {
+    const containerSelector = deriveContainerSelector(target);
+    cb({
+      success: true,
+      selector: containerSelector,
+      mode: 'card',
+      rawText: normalizeText(target.textContent),
+      tagName: target.tagName.toLowerCase()
+    });
+    return;
+  }
+
   const currentRulePromise = rulesRepository.findMatchingRule(normalizeHostname(window.location.hostname), computeLayoutFingerprint(document));
   currentRulePromise.then((rule) => {
-    const cardSelector = rule?.cardSelector;
+    const cardSelector = scopedCardSelector || rule?.cardSelector;
     let cardEl = null;
     if (cardSelector) {
       try { cardEl = target.closest(cardSelector); } catch {}
@@ -899,18 +985,24 @@ function onPickerClick(e) {
     cb({
       success: true,
       selector,
+      mode: 'field',
       rawText: normalizeText(target.textContent),
       tagName: target.tagName.toLowerCase(),
       isInsideCard: Boolean(cardEl)
     });
   }).catch(() => {
-    const selector = deriveCardRelativeSelector(target, null);
+    let cardEl = null;
+    if (scopedCardSelector) {
+      try { cardEl = target.closest(scopedCardSelector); } catch {}
+    }
+    const selector = deriveCardRelativeSelector(target, cardEl);
     cb({
       success: true,
       selector,
+      mode: 'field',
       rawText: normalizeText(target.textContent),
       tagName: target.tagName.toLowerCase(),
-      isInsideCard: false
+      isInsideCard: Boolean(cardEl)
     });
   });
 }

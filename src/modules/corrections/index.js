@@ -407,6 +407,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: proposedSelector || '',
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -431,6 +432,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -453,6 +455,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -476,6 +479,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -498,6 +502,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -523,6 +528,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -545,6 +551,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       proposedSelector: trimmedProposed,
       sampledCards: [],
       summary: {
+        totalMatchedCards: 0,
         totalSampled: 0,
         matchedCount: 0,
         validCount: 0,
@@ -554,7 +561,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
         requiresUserConfirmation: false,
         matchRate: 0
       },
-      errors: ['Card selector matched 0 elements in current DOM'],
+      errors: [`Card selector "${trimmedCardSelector}" matched 0 elements in current DOM`],
       warnings: []
     };
   }
@@ -666,8 +673,11 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
         isValidVal = true;
       }
     } else {
-      parsedValue = rawText;
-      isValidVal = true;
+      const valCheck = validateFieldValue(field, rawText);
+      if (valCheck.valid && valCheck.value !== null && valCheck.value !== undefined) {
+        parsedValue = valCheck.value;
+        isValidVal = true;
+      }
     }
 
     if (!isValidVal) {
@@ -675,6 +685,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       sampledCards.push({
         cardIndex: i,
         productIdentity,
+        rawTitleText: field === 'title' ? rawText : (productTitle || ''),
         matched: true,
         elementCount,
         rawText,
@@ -707,6 +718,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
     sampledCards.push({
       cardIndex: i,
       productIdentity,
+      rawTitleText: field === 'title' ? rawText : (productTitle || ''),
       matched: true,
       elementCount,
       rawText,
@@ -752,6 +764,7 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
     proposedSelector: trimmedProposed,
     sampledCards,
     summary: {
+      totalMatchedCards: matchedCards.length,
       totalSampled,
       matchedCount,
       validCount,
@@ -828,7 +841,7 @@ export async function applySelectorCorrection({
   const targetSelectorKey = FIELD_KEY_MAP[field] || 'priceSelector';
   const existingRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
 
-  const baseCardSelector = existingRule?.cardSelector || cardSelector?.trim();
+  const baseCardSelector = (cardSelector && cardSelector.trim()) || existingRule?.cardSelector;
   const baseFieldSelectors = { ...(existingRule?.fieldSelectors || {}) };
   baseFieldSelectors[targetSelectorKey] = proposedSelector.trim();
 

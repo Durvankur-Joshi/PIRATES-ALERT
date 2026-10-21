@@ -400,4 +400,93 @@ describe('Manual Selector Correction Suite', () => {
     const nonMatchingRule = await rulesRepository.findMatchingRule(host, differentFingerprint);
     expect(nonMatchingRule).toBeNull();
   });
+
+  it('fails preview with clear error when card selector is missing or empty', () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+
+    const previewEmpty = previewSelectorCorrection({
+      cardSelector: '',
+      field: 'title',
+      proposedSelector: '.product-title',
+      doc
+    });
+
+    expect(previewEmpty.valid).toBe(false);
+    expect(previewEmpty.summary.totalMatchedCards).toBe(0);
+    expect(previewEmpty.errors).toContain('Card selector is required to scope manual selector correction');
+
+    const previewUndefined = previewSelectorCorrection({
+      cardSelector: undefined,
+      field: 'sellingPrice',
+      proposedSelector: '.current-price',
+      doc
+    });
+
+    expect(previewUndefined.valid).toBe(false);
+    expect(previewUndefined.summary.totalMatchedCards).toBe(0);
+    expect(previewUndefined.errors).toContain('Card selector is required to scope manual selector correction');
+  });
+
+  it('fails preview with clear error when card selector matches zero elements in the current DOM', () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+
+    const nonExistentCardSelector = '.non-existent-card-container-xyz';
+    const preview = previewSelectorCorrection({
+      cardSelector: nonExistentCardSelector,
+      field: 'title',
+      proposedSelector: '.product-title',
+      doc
+    });
+
+    expect(preview.valid).toBe(false);
+    expect(preview.summary.totalMatchedCards).toBe(0);
+    expect(preview.summary.validCount).toBe(0);
+    expect(preview.errors.some((e) => e.includes(`Card selector "${nonExistentCardSelector}" matched 0 elements`))).toBe(true);
+  });
+
+  it('successfully previews and applies a valid card selector with a working title selector', async () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+    const host = 'store.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const preview = previewSelectorCorrection({
+      cardSelector: '.product-card',
+      field: 'title',
+      proposedSelector: '.product-title',
+      doc
+    });
+
+    expect(preview.valid).toBe(true);
+    expect(preview.summary.totalMatchedCards).toBeGreaterThanOrEqual(2);
+    expect(preview.summary.validCount).toBe(preview.summary.totalSampled);
+    expect(preview.summary.matchRate).toBe(100);
+    expect(preview.sampledCards.length).toBeGreaterThanOrEqual(2);
+
+    for (const card of preview.sampledCards) {
+      expect(typeof card.rawText).toBe('string');
+      expect(card.rawText.length).toBeGreaterThan(0);
+      expect(card.rawTitleText).toBe(card.rawText);
+      expect(card.parsedValue).toBe(card.rawText);
+      expect(card.validationStatus).toBe('VALID');
+    }
+
+    const applyResult = await applySelectorCorrection({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: '.product-card',
+      field: 'title',
+      proposedSelector: '.product-title',
+      userConfirmedAmbiguity: false,
+      doc,
+      url: 'https://store.example.com/search'
+    });
+
+    expect(applyResult.success).toBe(true);
+    expect(applyResult.rule.cardSelector).toBe('.product-card');
+    expect(applyResult.rule.fieldSelectors.titleSelector).toBe('.product-title');
+    expect(applyResult.rule.validationStatus).toBe('VALIDATED');
+  });
 });
