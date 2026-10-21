@@ -55,16 +55,39 @@ export function testCssSyntax(selector, rootDoc) {
   }
 }
 
-export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
+export function detectPageType(doc, baseUrl = '') {
+  if (!doc) return 'ecommerce';
+  const urlStr = String(baseUrl || '').toLowerCase();
+  const titleStr = (doc.title || '').toLowerCase();
+
+  const foodPattern = /\b(restaurants?|cuisines?|dishes|dining|food|delivery|order[-_]?food|menu|takeaway|baker(y|ies)|cafes?)\b/i;
+  if (foodPattern.test(urlStr) || foodPattern.test(titleStr)) {
+    return 'restaurant';
+  }
+
+  if (typeof doc.querySelector === 'function') {
+    if (doc.querySelector('[class*="restaurant"], [class*="cuisine"], [class*="dish"], [class*="menu-item"], [data-testid*="restaurant"], [id*="restaurant"]')) {
+      return 'restaurant';
+    }
+  }
+
+  return 'ecommerce';
+}
+
+export function validateRuleAgainstDoc(rule, doc, baseUrl = '', options = {}) {
   const errors = [];
   const warnings = [];
   const invalidFields = [];
   const missingFields = [];
   const ambiguousFields = [];
 
+  const pageType = options.pageType || rule?.pageType || detectPageType(doc, baseUrl);
+  const isRestaurant = pageType === 'restaurant';
+
   if (!rule || typeof rule !== 'object') {
     return {
       valid: false,
+      pageType,
       errors: ['Rule definition is missing or invalid object'],
       warnings: [],
       invalidFields: [],
@@ -178,7 +201,14 @@ export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
     };
   }
 
-  const fieldSelectors = rule.fieldSelectors || {};
+  const fieldSelectors = rule.fieldSelectors || {
+    titleSelector: rule.titleSelector,
+    priceSelector: rule.priceSelector,
+    mrpSelector: rule.mrpSelector,
+    urlSelector: rule.urlSelector,
+    imageSelector: rule.imageSelector,
+    ratingSelector: rule.ratingSelector
+  };
   const sampleItems = [];
   let validProductsCount = 0;
 
@@ -359,7 +389,11 @@ export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
       extra
     };
 
-    if (item.title && item.selling_price !== null) {
+    const isValidItem = isRestaurant
+      ? Boolean(item.title)
+      : Boolean(item.title && item.selling_price !== null);
+
+    if (isValidItem) {
       validProductsCount += 1;
     }
     sampleItems.push(item);
@@ -379,11 +413,21 @@ export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
 
   if (selectorStats.price.attempted) {
     if (selectorStats.price.matched === 0) {
-      errors.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" matched 0 elements across all sampled cards`);
-      invalidFields.push('priceSelector');
+      if (isRestaurant) {
+        warnings.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" matched 0 elements across all sampled cards (optional field)`);
+        missingFields.push('price');
+      } else {
+        errors.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" matched 0 elements across all sampled cards`);
+        invalidFields.push('priceSelector');
+      }
     } else if (selectorStats.price.extracted === 0) {
-      errors.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" failed to extract valid prices on any card`);
-      invalidFields.push('priceSelector');
+      if (isRestaurant) {
+        warnings.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" failed to extract valid prices on any card (optional field)`);
+        missingFields.push('price');
+      } else {
+        errors.push(`Supplied priceSelector "${fieldSelectors.priceSelector}" failed to extract valid prices on any card`);
+        invalidFields.push('priceSelector');
+      }
     }
   }
 
@@ -430,7 +474,11 @@ export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
   const matchRate = evaluatedCardsCount > 0 ? validProductsCount / evaluatedCardsCount : 0;
 
   if (matchRate < 0.5) {
-    errors.push(`Card selector matched elements, but only ${validProductsCount} of ${evaluatedCardsCount} produced valid product items with title and price.`);
+    if (isRestaurant) {
+      errors.push(`Card selector matched elements, but only ${validProductsCount} of ${evaluatedCardsCount} produced valid items with title.`);
+    } else {
+      errors.push(`Card selector matched elements, but only ${validProductsCount} of ${evaluatedCardsCount} produced valid product items with title and price.`);
+    }
     invalidFields.push('cardSelector');
   }
 
@@ -447,6 +495,7 @@ export function validateRuleAgainstDoc(rule, doc, baseUrl = '') {
 
   return {
     valid: isValid,
+    pageType,
     errors,
     warnings,
     invalidFields,

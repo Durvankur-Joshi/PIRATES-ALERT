@@ -10,6 +10,8 @@ import {
 } from '../src/modules/corrections/index.js';
 import { createExtractionEngine } from '../src/modules/extractor/index.js';
 import { EXTRACTION_SOURCE } from '../src/modules/messaging/protocol.js';
+import { aiLearning } from '../src/modules/ai/index.js';
+import { validateRuleAgainstDoc } from '../src/modules/rules/validator.js';
 
 function loadFixture(filename, baseUrl = 'https://store.example.com') {
   const filePath = path.resolve(__dirname, 'fixtures', filename);
@@ -488,5 +490,289 @@ describe('Manual Selector Correction Suite', () => {
     expect(applyResult.rule.cardSelector).toBe('.product-card');
     expect(applyResult.rule.fieldSelectors.titleSelector).toBe('.product-title');
     expect(applyResult.rule.validationStatus).toBe('VALIDATED');
+  });
+
+  it('persists canonical titleSelector in restaurant schema with re-read verification and extracts with zero AI calls', async () => {
+    const restaurantHtml = `
+      <html>
+        <head><title>Top Restaurants in City - Order Food Online</title></head>
+        <body>
+          <div class="restaurant-results">
+            <div class="jumbo-tracker">
+              <p class="sc-zjnivt-0">Veg Meal</p>
+              <div class="rating-tag">4.2</div>
+            </div>
+            <div class="jumbo-tracker">
+              <p class="sc-zjnivt-0">Biryani</p>
+              <div class="rating-tag">4.5</div>
+            </div>
+            <div class="jumbo-tracker">
+              <p class="sc-zjnivt-0">Pizza</p>
+              <div class="rating-tag">4.1</div>
+            </div>
+            <div class="jumbo-tracker">
+              <p class="sc-zjnivt-0">Thali</p>
+              <div class="rating-tag">4.6</div>
+            </div>
+            <div class="jumbo-tracker">
+              <p class="sc-zjnivt-0">Cake</p>
+              <div class="rating-tag">4.4</div>
+            </div>
+          </div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(restaurantHtml, { url: 'https://fooddelivery.example.com/restaurants' });
+    const doc = dom.window.document;
+    const host = 'fooddelivery.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const preview = previewSelectorCorrection({
+      cardSelector: 'div.jumbo-tracker',
+      field: 'title',
+      proposedSelector: 'p.sc-zjnivt-0',
+      doc,
+      url: 'https://fooddelivery.example.com/restaurants'
+    });
+
+    expect(preview.valid).toBe(true);
+    expect(preview.pageType).toBe('restaurant');
+    expect(preview.summary.validationStatus).toBe('VALIDATED');
+    expect(preview.summary.validCount).toBe(5);
+
+    const applyResult = await applySelectorCorrection({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: 'div.jumbo-tracker',
+      field: 'title',
+      proposedSelector: 'p.sc-zjnivt-0',
+      userConfirmedAmbiguity: false,
+      doc,
+      url: 'https://fooddelivery.example.com/restaurants'
+    });
+
+    expect(applyResult.success).toBe(true);
+    expect(applyResult.rule.fieldSelectors.titleSelector).toBe('p.sc-zjnivt-0');
+    expect(applyResult.rule.pageType).toBe('restaurant');
+
+    const reloaded = await rulesRepository.getRule(applyResult.rule.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded.fieldSelectors.titleSelector).toBe('p.sc-zjnivt-0');
+    expect(reloaded.validationStatus).toBe('VALIDATED');
+
+    const matchedRule = await rulesRepository.findMatchingRule(host, fingerprint);
+    expect(matchedRule).not.toBeNull();
+    expect(matchedRule.fieldSelectors.titleSelector).toBe('p.sc-zjnivt-0');
+
+    const engine = createExtractionEngine();
+    const extractRes = await engine.execute({
+      document: doc,
+      url: 'https://fooddelivery.example.com/restaurants',
+      rules: matchedRule
+    });
+
+    expect(extractRes.status).toBe('SUCCESS');
+    expect(extractRes.items.length).toBe(5);
+    expect(extractRes.items.map((i) => i.title)).toEqual(['Veg Meal', 'Biryani', 'Pizza', 'Thali', 'Cake']);
+  });
+
+  it('rejects title-only correction on e-commerce pages when required price validation fails', async () => {
+    const ecommerceHtml = `
+      <html>
+        <head><title>Online Store - Products</title></head>
+        <body>
+          <div class="product-grid">
+            <div class="item-card">
+              <h2 class="item-name">Wireless Mouse</h2>
+            </div>
+            <div class="item-card">
+              <h2 class="item-name">Mechanical Keyboard</h2>
+            </div>
+          </div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(ecommerceHtml, { url: 'https://shop.example.com/products' });
+    const doc = dom.window.document;
+    const host = 'shop.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const preview = previewSelectorCorrection({
+      cardSelector: '.item-card',
+      field: 'title',
+      proposedSelector: '.item-name',
+      doc,
+      url: 'https://shop.example.com/products'
+    });
+
+    expect(preview.valid).toBe(false);
+    expect(preview.fieldValid).toBe(true);
+    expect(preview.isFullyValidRule).toBe(false);
+    expect(preview.summary.validationStatus).toBe('PARTIAL');
+    expect(preview.errors.some((e) => e.includes('require a valid selling price'))).toBe(true);
+
+    const applyResult = await applySelectorCorrection({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: '.item-card',
+      field: 'title',
+      proposedSelector: '.item-name',
+      doc,
+      url: 'https://shop.example.com/products'
+    });
+
+    expect(applyResult.success).toBe(false);
+    expect(applyResult.error).toContain('require a valid selling price');
+
+    const saved = await rulesRepository.findMatchingRule(host, fingerprint);
+    expect(saved).toBeNull();
+  });
+
+  it('reuses active rule without invoking AI learning when valid rule exists in storage', async () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+    const host = 'store.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const saveRes = await rulesRepository.saveRule({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: '.product-card',
+      fieldSelectors: {
+        titleSelector: '.product-title',
+        priceSelector: '.current-price, .price'
+      },
+      validationStatus: 'VALIDATED',
+      testResults: { valid: true, acceptedCount: 3 }
+    });
+    expect(saveRes.success).toBe(true);
+
+    let aiCalled = false;
+    const origLearn = aiLearning.learnLayout;
+    aiLearning.learnLayout = async () => {
+      aiCalled = true;
+      return { success: false, error: 'AI should not be called' };
+    };
+
+    try {
+      const activeRule = await rulesRepository.findMatchingRule(host, fingerprint);
+      expect(activeRule).not.toBeNull();
+      const validation = validateRuleAgainstDoc(activeRule, doc, 'https://store.example.com');
+      expect(validation.valid).toBe(true);
+
+      const engine = createExtractionEngine();
+      const extraction = await engine.execute({
+        document: doc,
+        url: 'https://store.example.com',
+        rules: activeRule
+      });
+
+      expect(extraction.items.length).toBeGreaterThan(0);
+      expect(aiCalled).toBe(false);
+    } finally {
+      aiLearning.learnLayout = origLearn;
+    }
+  });
+
+  it('protects confirmed manual corrections from weaker AI proposals', async () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+    const host = 'store.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const manualRes = await rulesRepository.saveRule({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: '.product-card',
+      fieldSelectors: {
+        titleSelector: '.product-title',
+        priceSelector: '.current-price'
+      },
+      changeSource: 'manual_selector_correction',
+      validationStatus: 'VALIDATED',
+      testResults: { valid: true, acceptedCount: 10 }
+    });
+    expect(manualRes.success).toBe(true);
+
+    const weakAiAttempt = await rulesRepository.saveRule({
+      hostname: host,
+      layoutFingerprint: fingerprint,
+      cardSelector: '.product-card',
+      fieldSelectors: {
+        titleSelector: '.weaker-title'
+      },
+      changeSource: 'ai_learning',
+      validationStatus: 'VALIDATED',
+      testResults: { valid: true, acceptedCount: 2 }
+    });
+
+    expect(weakAiAttempt.success).toBe(false);
+    expect(weakAiAttempt.error).toContain('Cannot overwrite manually confirmed selector rule with weaker AI proposal');
+
+    const preserved = await rulesRepository.getRule(manualRes.rule.id);
+    expect(preserved.fieldSelectors.titleSelector).toBe('.product-title');
+  });
+
+  it('fails safely when storage write fails and does not claim activation', async () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+    const host = 'store.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const origSave = rulesRepository.saveRule;
+    rulesRepository.saveRule = async () => ({
+      success: false,
+      error: 'Simulated storage quota exceeded or disk write failure'
+    });
+
+    try {
+      const applyResult = await applySelectorCorrection({
+        hostname: host,
+        layoutFingerprint: fingerprint,
+        cardSelector: '.product-card',
+        field: 'title',
+        proposedSelector: '.product-title',
+        doc,
+        url: 'https://store.example.com'
+      });
+
+      expect(applyResult.success).toBe(false);
+      expect(applyResult.error).toContain('Simulated storage quota exceeded');
+    } finally {
+      rulesRepository.saveRule = origSave;
+    }
+  });
+
+  it('re-read verification fails if storage mutates or drops the target selector', async () => {
+    const dom = loadFixture('layout-grid.html');
+    const doc = dom.window.document;
+    const host = 'store.example.com';
+    const fingerprint = computeLayoutFingerprint(doc, host);
+
+    const origGet = rulesRepository.getRule;
+    rulesRepository.getRule = async () => ({
+      id: `rule_${host}_${fingerprint}`,
+      cardSelector: '.product-card',
+      fieldSelectors: {
+        titleSelector: '.corrupted-or-dropped-selector'
+      }
+    });
+
+    try {
+      const applyResult = await applySelectorCorrection({
+        hostname: host,
+        layoutFingerprint: fingerprint,
+        cardSelector: '.product-card',
+        field: 'title',
+        proposedSelector: '.product-title',
+        doc,
+        url: 'https://store.example.com'
+      });
+
+      expect(applyResult.success).toBe(false);
+      expect(applyResult.error).toContain('Persistence verification failed');
+    } finally {
+      rulesRepository.getRule = origGet;
+    }
   });
 });

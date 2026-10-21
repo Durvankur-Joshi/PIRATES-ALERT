@@ -46,6 +46,22 @@ async function performAutoLearning(hostname, layoutFingerprint, title, document,
     };
   }
 
+  const pastCorrections = await correctionsRepository.getCorrectionsForHost(hostname);
+  const relevantCorrections = (pastCorrections || []).filter(
+    (c) => c.layoutFingerprint === layoutFingerprint || !c.layoutFingerprint
+  );
+  const userEvidence = {};
+  for (const c of relevantCorrections) {
+    if (c.field && c.correctedValue) {
+      userEvidence[c.field] = c.correctedValue;
+    }
+  }
+
+  const mergedDiagnostics = {
+    ...(diagnostics || {}),
+    userEvidence
+  };
+
   let proposedRule = null;
   let validation = null;
   let lastError = null;
@@ -57,7 +73,7 @@ async function performAutoLearning(hostname, layoutFingerprint, title, document,
       hostname,
       pageTitle: title,
       candidateSelectors,
-      diagnostics: diagnostics || {},
+      diagnostics: mergedDiagnostics,
       domSnippets,
       callReason: 'automatic_learning',
       feedback
@@ -72,9 +88,16 @@ async function performAutoLearning(hostname, layoutFingerprint, title, document,
       hostname,
       layoutFingerprint,
       cardSelector: aiResult.proposedRule.cardSelector,
-      fieldSelectors: aiResult.proposedRule.fieldSelectors,
+      fieldSelectors: { ...(aiResult.proposedRule.fieldSelectors || {}) },
       confidence: aiResult.proposedRule.confidence
     };
+
+    for (const [fld, sel] of Object.entries(userEvidence)) {
+      const key = fld === 'title' ? 'titleSelector' : (fld === 'sellingPrice' || fld === 'selling_price' ? 'priceSelector' : null);
+      if (key && !proposedRule.fieldSelectors[key] && typeof sel === 'string') {
+        proposedRule.fieldSelectors[key] = sel;
+      }
+    }
 
     validation = validateRuleAgainstDoc(proposedRule, document, url);
 
@@ -249,6 +272,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (validation.valid) {
             extractionRule = {
               cardSelector: savedRule.cardSelector,
+              fieldSelectors: savedRule.fieldSelectors,
               ...savedRule.fieldSelectors
             };
             source = EXTRACTION_SOURCE.SAVED_RULE;
@@ -267,6 +291,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 if (learnResult.success && learnResult.rule) {
                   extractionRule = {
                     cardSelector: learnResult.rule.cardSelector,
+                    fieldSelectors: learnResult.rule.fieldSelectors,
                     ...learnResult.rule.fieldSelectors
                   };
                   source = EXTRACTION_SOURCE.SAVED_RULE;
@@ -287,6 +312,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                       if (fallbackCheck.valid) {
                         extractionRule = {
                           cardSelector: lastGood.cardSelector,
+                          fieldSelectors: lastGood.fieldSelectors,
                           ...lastGood.fieldSelectors
                         };
                         source = EXTRACTION_SOURCE.SAVED_RULE;
@@ -296,18 +322,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                   }
                   if (!extractionRule) {
-                    autoLearnStatus = `Recovery failed: ${learnResult.error || 'AI relearning unsuccessful.'}`;
+                    autoLearnStatus = `Layout rule recovery failed: ${learnResult.error || 'AI relearning unsuccessful.'} Using heuristic fallback.`;
                   }
                 }
               } catch (err) {
-                autoLearnStatus = `Recovery error: ${err?.message || 'Unknown error'}`;
+                autoLearnStatus = `Recovery error: ${err?.message || 'Unknown error'}. Using heuristic fallback.`;
               } finally {
                 isLearningBusy = false;
               }
             } else if (isOnCooldown(layoutFingerprint)) {
-              autoLearnStatus = 'Rule validation failed. Recovery on cooldown—retry shortly.';
+              autoLearnStatus = 'Rule validation failed. Recovery on cooldown—retry shortly. Using heuristic fallback.';
             } else if (isLearningBusy) {
-              autoLearnStatus = 'Rule validation failed. Recovery already in progress.';
+              autoLearnStatus = 'Rule validation failed. Recovery already in progress. Using heuristic fallback.';
             }
           }
         } else {
@@ -759,7 +785,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           cardSelector,
           field: message.field || 'sellingPrice',
           proposedSelector: message.proposedSelector,
-          doc: document
+          doc: document,
+          url,
+          existingRule: currentRule
         });
         sendResponse({ success: true, preview, currentRule });
       } catch (err) {

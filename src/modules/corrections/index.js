@@ -1,12 +1,13 @@
 import {
   normalizeText,
+  distinguishPrices,
   parseCurrencyAndPrice,
   extractPriceFromElement,
   extractTitle,
   extractProductId,
   queryCardElement
 } from '../extractor/utils.js';
-import { testCssSyntax, validateRuleAgainstDoc } from '../rules/validator.js';
+import { testCssSyntax, validateRuleAgainstDoc, detectPageType } from '../rules/validator.js';
 import { rulesRepository } from '../rules/index.js';
 import { regressionRepository } from '../regression/index.js';
 
@@ -395,13 +396,31 @@ export function detectMrpConfusion(element, cardEl, selector = '') {
   return { isLikelyMrp: false, reason: null };
 }
 
-export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice', proposedSelector, doc, maxCards = 15 }) {
+export function previewSelectorCorrection({
+  cardSelector,
+  field = 'sellingPrice',
+  proposedSelector,
+  doc,
+  maxCards = 15,
+  url = '',
+  existingRule = null
+}) {
   const errors = [];
   const warnings = [];
+
+  const pageType = existingRule?.pageType || detectPageType(doc, url);
+  const isRestaurant = pageType === 'restaurant';
 
   if (!proposedSelector || typeof proposedSelector !== 'string' || proposedSelector.trim().length === 0) {
     return {
       valid: false,
+      fieldValid: false,
+      isFullyValidRule: false,
+      syntaxValid: false,
+      domMatchesCount: 0,
+      usableValuesCount: 0,
+      pageType,
+      validationStatus: 'UNVALIDATED',
       field,
       cardSelector: cardSelector || '',
       proposedSelector: proposedSelector || '',
@@ -415,7 +434,9 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
         ambiguousCount: 0,
         likelyMrpCount: 0,
         requiresUserConfirmation: false,
-        matchRate: 0
+        matchRate: 0,
+        validationStatus: 'UNVALIDATED',
+        rejectionReasons: { missing: 0, ambiguous: 0, likely_mrp: 0, syntax_error: 1, outside_card: 0 }
       },
       errors: ['Proposed selector cannot be empty'],
       warnings: []
@@ -755,10 +776,60 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
     warnings.push(`Selector matched multiple elements in ${ambiguousCount} card(s). User confirmation is required.`);
   }
 
-  const isValid = errors.length === 0 && validCount > 0;
+  const isFieldValid = errors.length === 0 && validCount > 0 && matchRate >= 50;
+  let isFullyValidRule = isFieldValid;
+  let ruleValidationStatus = isFieldValid ? 'VALIDATED' : 'UNVALIDATED';
+
+  if (isFieldValid && !isRestaurant && (field === 'title')) {
+    let cardsWithPrice = 0;
+    for (const cardEl of sample) {
+      let foundPrice = false;
+      if (existingRule?.fieldSelectors?.priceSelector) {
+        try {
+          const pel = queryCardElement(cardEl, existingRule.fieldSelectors.priceSelector, trimmedCardSelector);
+          if (pel) {
+            const parsed = extractPriceFromElement(pel, true);
+            if (parsed.price !== null && typeof parsed.price === 'number') {
+              foundPrice = true;
+            }
+          }
+        } catch {}
+      }
+      if (!foundPrice) {
+        const p = distinguishPrices(cardEl);
+        if (p.selling_price !== null && typeof p.selling_price === 'number') {
+          foundPrice = true;
+        }
+      }
+      if (foundPrice) {
+        cardsWithPrice += 1;
+      }
+    }
+
+    if (cardsWithPrice === 0) {
+      isFullyValidRule = false;
+      ruleValidationStatus = 'PARTIAL';
+      errors.push(`E-commerce product rules require a valid selling price in addition to title. 0 of ${totalSampled} sampled cards have valid prices, so this rule cannot be marked as fully valid.`);
+    }
+  }
+
+  const rejectionReasons = {
+    missing: missingCount,
+    ambiguous: ambiguousCount,
+    likely_mrp: likelyMrpCount,
+    syntax_error: 0,
+    outside_card: sampledCards.filter((c) => c.validationStatus === 'OUTSIDE_CARD').length
+  };
 
   return {
-    valid: isValid,
+    valid: isFullyValidRule,
+    fieldValid: isFieldValid,
+    isFullyValidRule,
+    syntaxValid: true,
+    domMatchesCount: matchedCount,
+    usableValuesCount: validCount,
+    pageType,
+    validationStatus: ruleValidationStatus,
     field,
     cardSelector: trimmedCardSelector,
     proposedSelector: trimmedProposed,
@@ -772,7 +843,9 @@ export function previewSelectorCorrection({ cardSelector, field = 'sellingPrice'
       ambiguousCount,
       likelyMrpCount,
       requiresUserConfirmation,
-      matchRate
+      matchRate,
+      validationStatus: ruleValidationStatus,
+      rejectionReasons
     },
     errors,
     warnings
@@ -808,11 +881,15 @@ export async function applySelectorCorrection({
     return { success: false, error: 'Document root is required for revalidation' };
   }
 
+  const existingRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
+
   const preview = previewSelectorCorrection({
     cardSelector,
     field,
     proposedSelector,
-    doc
+    doc,
+    url,
+    existingRule
   });
 
   if (preview.summary.requiresUserConfirmation && !userConfirmedAmbiguity) {
@@ -828,6 +905,8 @@ export async function applySelectorCorrection({
     return { success: false, error: errorMsg, preview };
   }
 
+  const pageType = preview.pageType || detectPageType(doc, url);
+
   const FIELD_KEY_MAP = {
     sellingPrice: 'priceSelector',
     selling_price: 'priceSelector',
@@ -839,7 +918,6 @@ export async function applySelectorCorrection({
   };
 
   const targetSelectorKey = FIELD_KEY_MAP[field] || 'priceSelector';
-  const existingRule = await rulesRepository.findMatchingRule(hostname, layoutFingerprint);
 
   const baseCardSelector = (cardSelector && cardSelector.trim()) || existingRule?.cardSelector;
   const baseFieldSelectors = { ...(existingRule?.fieldSelectors || {}) };
@@ -850,13 +928,14 @@ export async function applySelectorCorrection({
     id: existingRule?.id || `rule_${hostname}_${layoutFingerprint}`,
     hostname,
     layoutFingerprint,
+    pageType,
     cardSelector: baseCardSelector,
     fieldSelectors: baseFieldSelectors,
     changeSource: 'manual_selector_correction',
     changeSummary: `Manual correction for ${field}: ${proposedSelector.trim()}`
   };
 
-  const liveValidation = validateRuleAgainstDoc(candidateRule, doc, url);
+  const liveValidation = validateRuleAgainstDoc(candidateRule, doc, url, { pageType });
   if (!liveValidation.valid) {
     return {
       success: false,
@@ -896,11 +975,35 @@ export async function applySelectorCorrection({
     };
   }
 
+  const reloadedRule = await rulesRepository.getRule(candidateRule.id);
+  if (
+    !reloadedRule ||
+    !reloadedRule.fieldSelectors ||
+    reloadedRule.fieldSelectors[targetSelectorKey] !== proposedSelector.trim()
+  ) {
+    return {
+      success: false,
+      error: `Persistence verification failed: ${targetSelectorKey} could not be confirmed in stored rule.`,
+      preservedRule: existingRule,
+      preview
+    };
+  }
+
+  try {
+    await correctionsRepository.saveCorrection({
+      hostname,
+      layoutFingerprint,
+      ruleId: reloadedRule.id,
+      field,
+      correctedValue: proposedSelector.trim()
+    });
+  } catch {}
+
   return {
     success: true,
-    rule: saveRes.rule,
+    rule: reloadedRule,
     previousVersionId: existingRule?.activeVersionId || null,
-    activeVersionId: saveRes.rule?.activeVersionId,
+    activeVersionId: reloadedRule.activeVersionId,
     preview
   };
 }

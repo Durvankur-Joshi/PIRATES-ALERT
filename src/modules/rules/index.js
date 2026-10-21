@@ -166,16 +166,17 @@ export function createRulesRepository() {
         const rules = Object.values(store);
         const targetHost = normalizeHostname(hostname);
 
-        const exactMatch = rules.find(
+        const matchedRules = rules.filter(
           (r) =>
             r &&
             normalizeHostname(r.hostname) === targetHost &&
             r.layoutFingerprint === layoutFingerprint &&
-            r.validationStatus === 'VALIDATED' &&
+            (r.validationStatus === 'VALIDATED' || r.validationStatus === 'PARTIAL') &&
             r.schemaVersion === '1.0' &&
             Boolean(r.cardSelector)
         );
 
+        const exactMatch = matchedRules.find((r) => r.validationStatus === 'VALIDATED') || matchedRules[0];
         return exactMatch ? migrateRuleRecord(exactMatch) : null;
       } catch {
         return null;
@@ -202,14 +203,14 @@ export function createRulesRepository() {
         const rawExisting = store[id];
         const existing = rawExisting ? migrateRuleRecord(rawExisting) : null;
 
-        const isExplicitlyValidated =
-          ruleDefinition.testResults &&
-          ruleDefinition.testResults.valid === true &&
-          ruleDefinition.validationStatus === 'VALIDATED';
+        let validationStatus = 'UNVALIDATED';
+        if (ruleDefinition.validationStatus === 'VALIDATED' && ruleDefinition.testResults && ruleDefinition.testResults.valid === true) {
+          validationStatus = 'VALIDATED';
+        } else if (ruleDefinition.validationStatus === 'PARTIAL') {
+          validationStatus = 'PARTIAL';
+        }
 
-        const validationStatus = isExplicitlyValidated ? 'VALIDATED' : 'UNVALIDATED';
-
-        if (existing && existing.validationStatus === 'VALIDATED' && validationStatus === 'UNVALIDATED') {
+        if (existing && (existing.validationStatus === 'VALIDATED' || existing.validationStatus === 'PARTIAL') && validationStatus === 'UNVALIDATED') {
           return {
             success: false,
             error: 'Cannot overwrite an existing validated rule with an unvalidated proposal',
@@ -217,7 +218,24 @@ export function createRulesRepository() {
           };
         }
 
-        if (ruleDefinition.testResults && ruleDefinition.testResults.valid === false) {
+        if (
+          ruleDefinition.changeSource === 'ai_learning' &&
+          existing &&
+          (existing.versions?.[existing.versions.length - 1]?.changeSource === 'manual_selector_correction' ||
+           existing.versions?.[existing.versions.length - 1]?.changeSource === 'user_correction')
+        ) {
+          const existingValidCount = existing.testResults?.acceptedCount || 0;
+          const incomingValidCount = ruleDefinition.testResults?.acceptedCount || 0;
+          if (incomingValidCount < existingValidCount) {
+            return {
+              success: false,
+              error: 'Cannot overwrite manually confirmed selector rule with weaker AI proposal',
+              preservedRule: existing
+            };
+          }
+        }
+
+        if (ruleDefinition.testResults && ruleDefinition.testResults.valid === false && validationStatus !== 'PARTIAL') {
           return {
             success: false,
             error: `Rule failed validation: ${(ruleDefinition.testResults.errors || []).join('; ')}`,
@@ -252,6 +270,7 @@ export function createRulesRepository() {
           createdAt: now,
           changeSource: ruleDefinition.changeSource || (existing ? 'user_correction' : 'ai_learning'),
           changeSummary: ruleDefinition.changeSummary || `Version ${newVersionNum}`,
+          pageType: ruleDefinition.pageType || existing?.pageType || 'ecommerce',
           cardSelector: ruleDefinition.cardSelector.trim(),
           fieldSelectors: ruleDefinition.fieldSelectors || {},
           parsingOptions: ruleDefinition.parsingOptions || {},
@@ -272,6 +291,7 @@ export function createRulesRepository() {
           hostname: normalizedHost,
           rawHostname: ruleDefinition.hostname,
           layoutFingerprint: ruleDefinition.layoutFingerprint,
+          pageType: ruleDefinition.pageType || existing?.pageType || 'ecommerce',
           cardSelector: ruleDefinition.cardSelector.trim(),
           fieldSelectors: ruleDefinition.fieldSelectors || {},
           parsingOptions: ruleDefinition.parsingOptions || {},

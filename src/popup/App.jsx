@@ -1307,8 +1307,8 @@ export default function App() {
             <div className="preview-results-container">
               <div className="preview-summary-bar">
                 <span className="summary-title">Preview Results:</span>
-                <span className={`summary-badge ${selectorPreview.valid ? 'valid' : 'invalid'}`}>
-                  {selectorPreview.valid ? 'VALID CANDIDATE' : 'INVALID'}
+                <span className={`summary-badge ${selectorPreview.valid ? 'valid' : (selectorPreview.summary?.validationStatus === 'PARTIAL' ? 'partial' : 'invalid')}`}>
+                  {selectorPreview.valid ? 'VALID CANDIDATE' : (selectorPreview.summary?.validationStatus === 'PARTIAL' ? 'PARTIAL (PRICE REQUIRED)' : 'INVALID')}
                 </span>
                 <span className="summary-rate">
                   {selectorPreview.summary.validCount}/{selectorPreview.summary.totalSampled} valid ({selectorPreview.summary.matchRate}%)

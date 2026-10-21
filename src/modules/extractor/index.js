@@ -16,10 +16,18 @@ import {
 import { findProductCards } from './cardDetector.js';
 
 function extractProductFromCard(cardEl, baseUrl, rule = {}) {
+  const cardSelector = rule.cardSelector;
+  const titleSelector = rule.titleSelector || rule.fieldSelectors?.titleSelector;
+  const urlSelector = rule.urlSelector || rule.fieldSelectors?.urlSelector;
+  const imageSelector = rule.imageSelector || rule.fieldSelectors?.imageSelector;
+  const priceSelector = rule.priceSelector || rule.fieldSelectors?.priceSelector;
+  const mrpSelector = rule.mrpSelector || rule.fieldSelectors?.mrpSelector;
+  const ratingSelector = rule.ratingSelector || rule.fieldSelectors?.ratingSelector;
+
   let title = null;
-  if (rule.titleSelector) {
+  if (titleSelector) {
     try {
-      const el = queryCardElement(cardEl, rule.titleSelector, rule.cardSelector);
+      const el = queryCardElement(cardEl, titleSelector, cardSelector);
       if (el) {
         title = normalizeText(el.textContent);
       }
@@ -30,9 +38,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   }
 
   let product_url = null;
-  if (rule.urlSelector) {
+  if (urlSelector) {
     try {
-      const el = queryCardElement(cardEl, rule.urlSelector, rule.cardSelector);
+      const el = queryCardElement(cardEl, urlSelector, cardSelector);
       if (el) {
         const href = el.getAttribute('href') || (el.closest ? el.closest('a')?.getAttribute('href') : null);
         if (href) {
@@ -48,9 +56,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   const product_id = extractProductId(cardEl, product_url);
 
   let image_url = null;
-  if (rule.imageSelector) {
+  if (imageSelector) {
     try {
-      const el = queryCardElement(cardEl, rule.imageSelector, rule.cardSelector);
+      const el = queryCardElement(cardEl, imageSelector, cardSelector);
       if (el) {
         image_url = extractImageUrl(el, baseUrl);
       }
@@ -61,9 +69,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   }
 
   let priceData = null;
-  if (rule.priceSelector) {
+  if (priceSelector) {
     try {
-      const el = queryCardElement(cardEl, rule.priceSelector, rule.cardSelector);
+      const el = queryCardElement(cardEl, priceSelector, cardSelector);
       if (el) {
         const parsed = extractPriceFromElement(el, true);
         if (parsed.price !== null) {
@@ -72,8 +80,8 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
             mrp: null,
             currency: parsed.currency
           };
-          if (rule.mrpSelector) {
-            const mrpEl = queryCardElement(cardEl, rule.mrpSelector, rule.cardSelector);
+          if (mrpSelector) {
+            const mrpEl = queryCardElement(cardEl, mrpSelector, cardSelector);
             if (mrpEl) {
               const mrpParsed = extractPriceFromElement(mrpEl, false);
               if (mrpParsed.price !== null) {
@@ -97,9 +105,9 @@ function extractProductFromCard(cardEl, baseUrl, rule = {}) {
   }
 
   let rating = null;
-  if (rule.ratingSelector) {
+  if (ratingSelector) {
     try {
-      const el = queryCardElement(cardEl, rule.ratingSelector, rule.cardSelector);
+      const el = queryCardElement(cardEl, ratingSelector, cardSelector);
       if (el) {
         rating = parseRating(el);
       }
@@ -215,7 +223,13 @@ export function createExtractionEngine(config = {}) {
       for (const cardEl of candidateCards) {
         const item = extractProductFromCard(cardEl, url, rule);
 
-        if (!item.title || (item.selling_price === null && item.image_url === null)) {
+        if (!item.title) {
+          rejectedCount += 1;
+          rejectionReasons.missing_identity += 1;
+          continue;
+        }
+
+        if (!rule.cardSelector && item.selling_price === null && item.image_url === null && item.product_url === null && item.rating === null) {
           rejectedCount += 1;
           rejectionReasons.missing_identity += 1;
           continue;
